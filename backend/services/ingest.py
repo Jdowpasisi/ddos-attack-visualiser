@@ -13,28 +13,27 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
-# Load environment variables from .env file
 from dotenv import load_dotenv
-
-load_dotenv()
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Add backend to path for imports
+# Add backend to path for imports (must be before local imports)
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
-from database import async_session_maker
-from ml.predictor import Protocol, predict_threat
-from models import AttackEvent
-from services.feeds import (
+# Load environment variables
+load_dotenv()
+
+from database import async_session_maker  # noqa: E402
+from ml.predictor import Protocol, predict_threat  # noqa: E402
+from models import AttackEvent  # noqa: E402
+from services.feeds import (  # noqa: E402
     ThreatIndicator,
     fetch_abuseipdb_threats,
     fetch_cloudflare_targets,
     get_feed_service,
     get_real_threat_ips,
 )
-from services.geo import (
+from services.geo import (  # noqa: E402
     GeoService,
     get_geo_service,
 )

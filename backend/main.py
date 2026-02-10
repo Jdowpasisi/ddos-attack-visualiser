@@ -3,6 +3,7 @@ FastAPI application entry point for the DDoS Attack Map.
 """
 
 import asyncio
+import contextlib
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -108,10 +109,8 @@ async def lifespan(app: FastAPI):
     _stop_ingestion = True
     if _ingestion_task:
         _ingestion_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await _ingestion_task
-        except asyncio.CancelledError:
-            pass
 
     print("Application shutting down.")
 
