@@ -1,0 +1,91 @@
+# Docker Compose for DDoS Attack Visualizer
+# Run with: docker-compose up --build
+
+version: '3.8'
+
+services:
+  # ============ PostgreSQL Database ============
+  db:
+    image: postgres:15-alpine
+    container_name: ddos-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: ddos_attack_map
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ddos_attack_map"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ddos-network
+
+  # ============ FastAPI Backend ============
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ddos-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      # Database connection (uses Docker service name 'db')
+      DATABASE_URL: postgresql+asyncpg://postgres:pass@db:5432/ddos_attack_map
+      
+      # Application settings
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      
+      # Ingestion settings
+      INGESTION_INTERVAL_SECONDS: "10"
+      INGESTION_BATCH_SIZE: "5"
+      
+      # Geo service backend (ip-api for real coordinates)
+      GEO_BACKEND: ip-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - ddos-network
+
+  # ============ React Frontend ============
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # API URL for frontend to call backend
+        VITE_API_URL: http://localhost:8000
+    container_name: ddos-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - ddos-network
+
+# ============ Volumes ============
+volumes:
+  postgres_data:
+    driver: local
+
+# ============ Networks ============
+networks:
+  ddos-network:
+    driver: bridge

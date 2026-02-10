@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+/* Import Google Fonts for digital display look */
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Share+Tech+Mono&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+/* Custom theme extensions */
+@theme {
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Consolas', monospace;
+  --font-digital: 'Orbitron', 'Share Tech Mono', monospace;
+  
+  --color-cyber-blue: #00d4ff;
+  --color-cyber-green: #00ff88;
+  --color-cyber-red: #ff4444;
+  --color-cyber-orange: #ffaa00;
+  --color-cyber-purple: #a855f7;
+  --color-cyber-dark: #0a0a1a;
+  
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-glow: glow 2s ease-in-out infinite alternate;
+  --animate-slide-up: slideUp 0.3s ease-out;
+  
+  @keyframes glow {
+    0% { box-shadow: 0 0 5px rgba(0, 212, 255, 0.5), 0 0 10px rgba(0, 212, 255, 0.3); }
+    100% { box-shadow: 0 0 10px rgba(0, 212, 255, 0.8), 0 0 20px rgba(0, 212, 255, 0.5); }
+  }
+  
+  @keyframes slideUp {
+    0% { transform: translateY(10px); opacity: 0; }
+    100% { transform: translateY(0); opacity: 1; }
+  }
+}
+
+/* Custom utility classes */
+@utility glass-card {
+  backdrop-filter: blur(12px);
+  background-color: rgb(0 0 0 / 0.5);
+  border: 1px solid rgb(6 182 212 / 0.2);
+  border-radius: 0.75rem;
+  box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+}
+
+@utility cyber-glow {
+  box-shadow: 0 0 10px rgba(0, 212, 255, 0.3), 
+              0 0 20px rgba(0, 212, 255, 0.1),
+              inset 0 0 20px rgba(0, 212, 255, 0.05);
+}
+
+@utility digital-text {
+  font-family: 'Orbitron', 'Share Tech Mono', monospace;
+  letter-spacing: 0.05em;
+}
+
+@utility mono-text {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+@utility threat-low {
+  color: #4ade80;
+}
+
+@utility threat-medium {
+  color: #facc15;
+}
+
+@utility threat-high {
+  color: #f97316;
+}
+
+@utility threat-critical {
+  color: #ef4444;
+}
+
+@utility custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(6 182 212 / 0.3) transparent;
+}
+
+/* Base styles */
+@layer base {
+  body {
+    background-color: black;
+    color: white;
+    -webkit-font-smoothing: antialiased;
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* Keyframe animations */
+@keyframes threat-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.7;
+    transform: scale(1.05);
+  }
+}
+
+@keyframes scan-line {
+  0% {
+    transform: translateY(-100%);
+  }
+  100% {
+    transform: translateY(100%);
+  }
+}
+
+.animate-threat-pulse {
+  animation: threat-pulse 2s ease-in-out infinite;
+}
+
+.animate-scan-line {
+  animation: scan-line 3s linear infinite;
+}

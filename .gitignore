@@ -1,0 +1,27 @@
+# .gitignore
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+node_modules/
+.env
+.env.local
+*.env.local
+*.db
+.DS_Store
+dist/
+build/
+coverage/
+.pytest_cache/
+
+# ML model (can be regenerated)
+model.pkl
+*.pkl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
