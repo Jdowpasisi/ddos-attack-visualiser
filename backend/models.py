@@ -1,8 +1,8 @@
 """
 SQLAlchemy models for the DDoS Attack Map application.
 """
+
 from datetime import datetime
-from typing import Optional
 
 from sqlalchemy import DateTime, Float, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
@@ -13,7 +13,7 @@ from database import Base
 class AttackEvent(Base):
     """
     Model representing a DDoS attack event.
-    
+
     Attributes:
         id: Primary key, auto-incremented.
         timestamp: UTC timestamp of when the attack was detected.
@@ -27,6 +27,7 @@ class AttackEvent(Base):
         packet_rate: Number of packets per second.
         severity_score: Severity score of the attack (0.0 - 10.0).
     """
+
     __tablename__ = "attack_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

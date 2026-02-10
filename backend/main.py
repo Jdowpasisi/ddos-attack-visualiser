@@ -1,11 +1,11 @@
 """
 FastAPI application entry point for the DDoS Attack Map.
 """
+
 import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -14,16 +14,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.routes import router as api_router
 from database import create_tables, get_db
 from models import AttackEvent
-from api.routes import router as api_router
 from services.ingest import ingest_threats
 
 # Load environment variables
 load_dotenv()
 
 # Background task control
-_ingestion_task: Optional[asyncio.Task] = None
+_ingestion_task: asyncio.Task | None = None
 _stop_ingestion = False
 
 # Configuration from environment
@@ -37,24 +37,27 @@ async def background_ingestion_loop():
     Runs every INGESTION_INTERVAL_SECONDS.
     """
     global _stop_ingestion
-    
-    print(f"Background ingestion started (interval: {INGESTION_INTERVAL_SECONDS}s, batch: {INGESTION_BATCH_SIZE})")
-    
+
+    print(
+        f"Background ingestion started (interval: {INGESTION_INTERVAL_SECONDS}s, batch: {INGESTION_BATCH_SIZE})"
+    )
+
     while not _stop_ingestion:
         try:
             await ingest_threats(count=INGESTION_BATCH_SIZE)
         except Exception as e:
             print(f"Ingestion error: {e}")
-        
+
         # Wait for next interval
         await asyncio.sleep(INGESTION_INTERVAL_SECONDS)
-    
+
     print("Background ingestion stopped.")
 
 
 # Pydantic schemas
 class AttackEventBase(BaseModel):
     """Base schema for attack event data."""
+
     timestamp: datetime
     source_ip: str = Field(..., max_length=45)
     target_ip: str = Field(..., max_length=45)
@@ -69,11 +72,13 @@ class AttackEventBase(BaseModel):
 
 class AttackEventCreate(AttackEventBase):
     """Schema for creating a new attack event."""
+
     pass
 
 
 class AttackEventResponse(AttackEventBase):
     """Schema for attack event response."""
+
     id: int
 
     class Config:
@@ -87,17 +92,17 @@ async def lifespan(app: FastAPI):
     Creates database tables on startup and starts background ingestion.
     """
     global _ingestion_task, _stop_ingestion
-    
+
     # Startup: Create tables
     await create_tables()
     print("Database tables created successfully.")
-    
+
     # Start background ingestion task
     _stop_ingestion = False
     _ingestion_task = asyncio.create_task(background_ingestion_loop())
-    
+
     yield
-    
+
     # Shutdown: Stop background ingestion
     print("Stopping background ingestion...")
     _stop_ingestion = True
@@ -107,7 +112,7 @@ async def lifespan(app: FastAPI):
             await _ingestion_task
         except asyncio.CancelledError:
             pass
-    
+
     print("Application shutting down.")
 
 
@@ -142,33 +147,33 @@ async def root():
     }
 
 
-@app.get("/attacks", response_model=List[AttackEventResponse])
+@app.get("/attacks", response_model=list[AttackEventResponse])
 async def get_attacks(
     db: AsyncSession = Depends(get_db),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    attack_type: Optional[str] = Query(default=None),
+    attack_type: str | None = Query(default=None),
 ):
     """
     Retrieve attack events with optional filtering.
-    
+
     Args:
         limit: Maximum number of records to return (1-1000).
         offset: Number of records to skip.
         attack_type: Filter by attack type.
-    
+
     Returns:
         List of attack events.
     """
     query = select(AttackEvent).order_by(AttackEvent.timestamp.desc())
-    
+
     if attack_type:
         query = query.where(AttackEvent.attack_type == attack_type)
-    
+
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     attacks = result.scalars().all()
-    
+
     return attacks
 
 
@@ -176,23 +181,23 @@ async def get_attacks(
 async def get_attack(attack_id: int, db: AsyncSession = Depends(get_db)):
     """
     Retrieve a specific attack event by ID.
-    
+
     Args:
         attack_id: The ID of the attack event.
-    
+
     Returns:
         The attack event if found.
-    
+
     Raises:
         HTTPException: If the attack event is not found.
     """
     query = select(AttackEvent).where(AttackEvent.id == attack_id)
     result = await db.execute(query)
     attack = result.scalar_one_or_none()
-    
+
     if not attack:
         raise HTTPException(status_code=404, detail="Attack event not found")
-    
+
     return attack
 
 
@@ -203,10 +208,10 @@ async def create_attack(
 ):
     """
     Create a new attack event.
-    
+
     Args:
         attack_data: The attack event data.
-    
+
     Returns:
         The created attack event.
     """
@@ -214,7 +219,7 @@ async def create_attack(
     db.add(attack)
     await db.flush()
     await db.refresh(attack)
-    
+
     return attack
 
 
@@ -222,30 +227,29 @@ async def create_attack(
 async def get_attack_stats(db: AsyncSession = Depends(get_db)):
     """
     Get summary statistics of attack events.
-    
+
     Returns:
         Dictionary with attack statistics.
     """
     from sqlalchemy import func
-    
+
     # Total count
     total_query = select(func.count(AttackEvent.id))
     total_result = await db.execute(total_query)
     total_count = total_result.scalar()
-    
+
     # Count by attack type
     type_query = select(
-        AttackEvent.attack_type,
-        func.count(AttackEvent.id).label("count")
+        AttackEvent.attack_type, func.count(AttackEvent.id).label("count")
     ).group_by(AttackEvent.attack_type)
     type_result = await db.execute(type_query)
     attacks_by_type = {row.attack_type: row.count for row in type_result}
-    
+
     # Average severity
     avg_query = select(func.avg(AttackEvent.severity_score))
     avg_result = await db.execute(avg_query)
     avg_severity = avg_result.scalar()
-    
+
     return {
         "total_attacks": total_count,
         "attacks_by_type": attacks_by_type,
@@ -257,10 +261,10 @@ async def get_attack_stats(db: AsyncSession = Depends(get_db)):
 async def trigger_ingestion(count: int = Query(default=10, ge=1, le=100)):
     """
     Manually trigger threat ingestion.
-    
+
     Args:
         count: Number of threats to ingest.
-    
+
     Returns:
         Number of events ingested.
     """
@@ -283,5 +287,5 @@ async def ingestion_status():
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

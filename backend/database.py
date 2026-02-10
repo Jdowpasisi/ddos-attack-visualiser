@@ -1,6 +1,7 @@
 """
 Database configuration module using SQLAlchemy async engine.
 """
+
 import os
 from collections.abc import AsyncGenerator
 
@@ -13,8 +14,7 @@ load_dotenv()
 
 # PostgreSQL async connection string from environment
 DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/ddos_attack_map"
+    "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/ddos_attack_map"
 )
 
 # Debug mode from environment
