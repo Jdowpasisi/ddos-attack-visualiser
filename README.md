@@ -222,7 +222,6 @@ ddos-attack-visualiser/
 ├── docs/
 │   └── screenshots/            # Project screenshots
 ├── docker-compose.yml
-├── PROJECT_REPORT.md           # Technical report
 └── README.md
 ```
 
