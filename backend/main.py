@@ -17,7 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.routes import router as api_router
 from database import create_tables, get_db
-from models import AttackEvent
+
+# Import all model classes to register them with Base.metadata
+from models import AttackEvent, IPReputation  # noqa: F401
+
+from services.feeds import refresh_abuseipdb_blacklist, refresh_free_blocklists
 from services.ingest import ingest_threats
 
 # Load environment variables
@@ -25,11 +29,14 @@ load_dotenv()
 
 # Background task control
 _ingestion_task: asyncio.Task | None = None
+_blacklist_task: asyncio.Task | None = None
+_free_list_task: asyncio.Task | None = None
 _stop_ingestion = False
 
 # Configuration from environment
 INGESTION_INTERVAL_SECONDS = int(os.getenv("INGESTION_INTERVAL_SECONDS", "10"))
 INGESTION_BATCH_SIZE = int(os.getenv("INGESTION_BATCH_SIZE", "5"))
+BLACKLIST_REFRESH_HOURS = 24  # Refresh AbuseIPDB blacklist every 24 hours
 
 
 async def background_ingestion_loop():
@@ -53,6 +60,55 @@ async def background_ingestion_loop():
         await asyncio.sleep(INGESTION_INTERVAL_SECONDS)
 
     print("Background ingestion stopped.")
+
+
+async def background_blacklist_refresh_loop():
+    """
+    Background task that periodically refreshes the AbuseIPDB blacklist.
+    Runs every BLACKLIST_REFRESH_HOURS hours.
+    """
+    global _stop_ingestion
+
+    print(
+        f"Background blacklist refresh started (interval: {BLACKLIST_REFRESH_HOURS}h)"
+    )
+
+    while not _stop_ingestion:
+        try:
+            count = await refresh_abuseipdb_blacklist()
+            if count > 0:
+                print(f"Blacklist refresh: loaded {count} IPs into reputation cache")
+            else:
+                print("Blacklist refresh: no IPs fetched (check API key or rate limits)")
+        except Exception as e:
+            print(f"Blacklist refresh error: {e}")
+
+        # Wait for next interval
+        await asyncio.sleep(BLACKLIST_REFRESH_HOURS * 3600)
+
+    print("Background blacklist refresh stopped.")
+
+
+async def background_free_blocklist_loop():
+    """Refreshes free blocklists every hour."""
+    global _stop_ingestion
+
+    print("Background free blocklist refresh started (interval: 1h)")
+
+    while not _stop_ingestion:
+        try:
+            count = await refresh_free_blocklists()
+            if count > 0:
+                print(f"[FreeLists] Successfully loaded {count} malicious IPs")
+            else:
+                print("[FreeLists] No IPs fetched (check connectivity or blocklist availability)")
+        except Exception as e:
+            print(f"[FreeLists] Refresh failed: {e}")
+        
+        # Sleep for 1 hour (3600 seconds)
+        await asyncio.sleep(3600)
+    
+    print("Background free blocklist refresh stopped.")
 
 
 # Pydantic schemas
@@ -92,7 +148,7 @@ async def lifespan(app: FastAPI):
     Application lifespan handler.
     Creates database tables on startup and starts background ingestion.
     """
-    global _ingestion_task, _stop_ingestion
+    global _ingestion_task, _blacklist_task, _free_list_task, _stop_ingestion
 
     # Startup: Create tables
     await create_tables()
@@ -102,15 +158,32 @@ async def lifespan(app: FastAPI):
     _stop_ingestion = False
     _ingestion_task = asyncio.create_task(background_ingestion_loop())
 
+    # Start background blacklist refresh task
+    _blacklist_task = asyncio.create_task(background_blacklist_refresh_loop())
+
+    # Start background free blocklist refresh task
+    _free_list_task = asyncio.create_task(background_free_blocklist_loop())
+
     yield
 
-    # Shutdown: Stop background ingestion
-    print("Stopping background ingestion...")
+    # Shutdown: Stop background tasks
+    print("Stopping background tasks...")
     _stop_ingestion = True
+
     if _ingestion_task:
         _ingestion_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _ingestion_task
+
+    if _blacklist_task:
+        _blacklist_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _blacklist_task
+
+    if _free_list_task:
+        _free_list_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _free_list_task
 
     print("Application shutting down.")
 

@@ -2,7 +2,7 @@
 SQLAlchemy models for the DDoS Attack Map application.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, Float, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
@@ -53,4 +53,49 @@ class AttackEvent(Base):
             f"target_ip='{self.target_ip}', "
             f"attack_type='{self.attack_type}', "
             f"severity_score={self.severity_score})>"
+        )
+
+
+class IPReputation(Base):
+    """
+    Persistent cache for IP reputation data from AbuseIPDB (or mock source).
+
+    Attributes:
+        ip: IPv4/IPv6 address (primary key).
+        abuse_score: AbuseIPDB confidence-of-abuse score (0-100).
+        country_code: Two-letter ISO country code.
+        isp: Internet service provider name.
+        domain: Domain associated with the IP.
+        total_reports: Number of abuse reports on record.
+        source: Data origin ('abuseipdb' or 'mock').
+        last_fetched: UTC timestamp of when the record was last refreshed.
+    """
+
+    __tablename__ = "ip_reputation"
+
+    ip: Mapped[str] = mapped_column(String(45), primary_key=True)
+    abuse_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    country_code: Mapped[str] = mapped_column(String(10), nullable=True)
+    isp: Mapped[str] = mapped_column(String(200), nullable=True)
+    domain: Mapped[str] = mapped_column(String(200), nullable=True)
+    total_reports: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(50), nullable=False)  # 'abuseipdb'|'mock'
+    last_fetched: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    def is_fresh(self, max_age_days: int = 7) -> bool:
+        """Checks if the record is fresh enough to trust."""
+        if self.last_fetched.tzinfo is None:
+            # Handle naive datetimes if necessary, though we prefer aware
+            age = datetime.now(UTC) - self.last_fetched.replace(tzinfo=UTC)
+        else:
+            age = datetime.now(UTC) - self.last_fetched
+        return age.days < max_age_days
+
+    def __repr__(self) -> str:
+        return (
+            f"<IPReputation(ip='{self.ip}', "
+            f"abuse_score={self.abuse_score}, "
+            f"source='{self.source}')>"
         )

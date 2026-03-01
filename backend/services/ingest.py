@@ -432,6 +432,10 @@ async def enrich_threat_with_geo(threat: dict, geo_service: GeoService) -> dict:
     """
     Enrich threat data with geographic coordinates.
 
+    If the threat dict already contains pre-cached 'source_geo' and 'target_geo'
+    keys (from batch caching), those are used directly. Otherwise, falls back
+    to geo service resolution.
+
     Args:
         threat: Raw threat dictionary.
         geo_service: Geo service for IP resolution.
@@ -439,9 +443,18 @@ async def enrich_threat_with_geo(threat: dict, geo_service: GeoService) -> dict:
     Returns:
         Enriched threat dictionary with coordinates.
     """
-    # Resolve source and target IPs to coordinates
-    source_geo = await geo_service.resolve(threat["source_ip"])
-    target_geo = await geo_service.resolve(threat["target_ip"])
+    # Use pre-cached geo data if available (batch optimization)
+    if "source_geo" in threat:
+        source_geo = threat["source_geo"]
+    else:
+        # Fallback: resolve source IP
+        source_geo = await geo_service.resolve(threat["source_ip"])
+
+    if "target_geo" in threat:
+        target_geo = threat["target_geo"]
+    else:
+        # Fallback: resolve target IP
+        target_geo = await geo_service.resolve(threat["target_ip"])
 
     threat["source_lat"] = source_geo.lat
     threat["source_lon"] = source_geo.lon
@@ -504,6 +517,13 @@ async def process_and_store_threat(
     """
     Process a single threat: enrich, score, and store.
 
+    Enrichment now includes an IP reputation lookup that is cached in the
+    ``ip_reputation`` table so that subsequent ingestions for the same
+    source IP avoid redundant AbuseIPDB API calls.
+
+    Additionally supports batch-level caching where reputation data is
+    pre-fetched and attached to the threat dict as 'reputation' key.
+
     Args:
         threat: Raw threat dictionary.
         db_session: Database session.
@@ -512,11 +532,46 @@ async def process_and_store_threat(
     Returns:
         Created AttackEvent record.
     """
-    # Enrich with geo data
+    # Enrich with geo data (uses pre-cached data if available)
     enriched = await enrich_threat_with_geo(threat, geo_service)
 
-    # Score the threat (runs in thread pool to avoid blocking)
+    # Look up source-IP reputation from the bulk-cached blacklist database
+    reputation: dict | None = None
+    
+    # Use pre-cached reputation if available (batch optimization)
+    if "reputation" in threat:
+        reputation = threat["reputation"]
+    else:
+        # Fallback: fetch reputation data
+        try:
+            feed_service = get_feed_service()
+            reputation = await feed_service.get_ip_reputation(
+                ip=enriched["source_ip"],
+                db=db_session,
+                api_key=ABUSEIPDB_API_KEY or None,
+            )
+            
+            if reputation is None:
+                # IP not found in blacklist database - treat as neutral/unknown
+                # This is normal for IPs that haven't been reported to AbuseIPDB
+                pass  # Continue with base ML/geo scoring only
+            
+        except Exception as exc:
+            # Never let a reputation lookup failure break the pipeline
+            print(f"  Reputation lookup error for {enriched['source_ip']}: {exc}")
+            reputation = None  # Treat as neutral on error
+
+    # Score the threat using ML model (runs in thread pool to avoid blocking)
     severity_score = await score_threat_async(enriched)
+
+    # Apply reputation bonus if IP is confirmed high-risk in AbuseIPDB
+    if reputation is not None:
+        abuse_score = reputation.get("abuse_score", 0)
+        if abuse_score >= 75:
+            # High-confidence malicious IP: boost severity by up to +2.0
+            abuse_bonus = min(2.0, abuse_score / 100 * 2)
+            severity_score = min(10.0, round(severity_score + abuse_bonus, 2))
+        # IPs with abuse_score < 75 get no bonus (treated as neutral)
 
     # Create database record
     attack_event = AttackEvent(
@@ -541,6 +596,10 @@ async def ingest_threats(count: int = 10, use_real_feeds: bool = None) -> list[A
     """
     Main ingestion pipeline: fetch, enrich, score, and store threats.
 
+    Implements batch-level caching to avoid duplicate lookups for the same
+    IP address within a single batch (e.g., if 3 threats come from the same
+    source IP, only 1 reputation/geo lookup is performed).
+
     Args:
         count: Number of threats to ingest.
         use_real_feeds: Whether to use real threat feeds (None = use global default).
@@ -559,10 +618,57 @@ async def ingest_threats(count: int = 10, use_real_feeds: bool = None) -> list[A
     print(f"Fetching {count} threat events ({feed_type}, geo: {geo_backend})...")
     threats = await fetch_live_threats(count=count, use_real_feeds=use_real_feeds)
 
+    # --- BATCH-LEVEL CACHING: Pre-fetch data for unique IPs ---
+    # Extract unique IPs from the batch
+    unique_source_ips = set(t["source_ip"] for t in threats)
+    unique_target_ips = set(t["target_ip"] for t in threats)
+    all_unique_ips = unique_source_ips | unique_target_ips
+
+    # Initialize batch caches
+    _batch_reputation_cache: dict[str, dict | None] = {}
+    _batch_geo_cache: dict[str, object] = {}
+
+    print(f"  Batch: {len(threats)} threats, {len(all_unique_ips)} unique IPs")
+
     # Process and store each threat
     created_events = []
 
     async with async_session_maker() as session:
+        # Pre-fetch reputation data for all unique source IPs
+        feed_service = get_feed_service()
+        for source_ip in unique_source_ips:
+            if source_ip not in _batch_reputation_cache:
+                try:
+                    reputation = await feed_service.get_ip_reputation(
+                        ip=source_ip,
+                        db=session,
+                        api_key=ABUSEIPDB_API_KEY or None,
+                    )
+                    _batch_reputation_cache[source_ip] = reputation
+                except Exception as exc:
+                    print(f"  Batch reputation lookup error for {source_ip}: {exc}")
+                    _batch_reputation_cache[source_ip] = None
+
+        # Pre-fetch geo data for all unique IPs
+        for ip in all_unique_ips:
+            if ip not in _batch_geo_cache:
+                try:
+                    geo_data = await geo_service.resolve(ip)
+                    _batch_geo_cache[ip] = geo_data
+                except Exception as exc:
+                    print(f"  Batch geo lookup error for {ip}: {exc}")
+                    _batch_geo_cache[ip] = None
+
+        # Attach cached data to threats
+        for threat in threats:
+            # Attach pre-fetched reputation
+            threat["reputation"] = _batch_reputation_cache.get(threat["source_ip"])
+            
+            # Attach pre-fetched geo data
+            threat["source_geo"] = _batch_geo_cache.get(threat["source_ip"])
+            threat["target_geo"] = _batch_geo_cache.get(threat["target_ip"])
+
+        # Process each threat (using cached data)
         for threat in threats:
             try:
                 event = await process_and_store_threat(

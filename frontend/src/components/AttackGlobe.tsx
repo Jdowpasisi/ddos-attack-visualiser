@@ -38,7 +38,8 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const FETCH_INTERVAL_MS = 5000;
 
 // Arc TTL (Time To Live) in milliseconds - attacks fade after this time
-const ARC_TTL_MS = 30000; // 30 seconds
+// Increased to keep attacks visible longer (5 minutes)
+const ARC_TTL_MS = 300000; // 5 minutes (300 seconds)
 
 // Maximum number of arcs to keep in state
 const MAX_ARCS = 100;
@@ -94,7 +95,11 @@ const AttackGlobe: React.FC = () => {
     color: getSeverityColor(attack.severity),
     stroke: Math.max(0.5, Math.min(3, attack.strokeWidth)),
     label: `${attack.attackType} | ${attack.sourceIp} → ${attack.targetIp} | Severity: ${attack.severity}`,
-    data: attack,
+    data: {
+      ...attack,
+      // Use current time for TTL calculation so attacks appear "live"
+      timestamp: new Date().toISOString(),
+    },
   }), []);
 
   // Filter out expired arcs based on TTL

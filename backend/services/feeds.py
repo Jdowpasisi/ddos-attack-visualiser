@@ -22,6 +22,11 @@ from datetime import UTC, datetime
 
 import httpx
 from dotenv import load_dotenv
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database import async_session_maker
+from models import IPReputation
 
 # Load environment variables
 load_dotenv()
@@ -31,10 +36,19 @@ logger = logging.getLogger(__name__)
 # Feed configuration
 FEODO_TRACKER_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.csv"
 ABUSEIPDB_BLACKLIST_URL = "https://api.abuseipdb.com/api/v2/blacklist"
+ABUSEIPDB_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CLOUDFLARE_RADAR_L3_URL = (
     "https://api.cloudflare.com/client/v4/radar/attacks/layer3/top/locations/target"
 )
+
+# Free blocklist URLs (no API key required)
+SPAMHAUS_DROP_URL = "https://www.spamhaus.org/drop/drop.txt"
+SPAMHAUS_EDROP_URL = "https://www.spamhaus.org/drop/edrop.txt"
+EMERGING_THREATS_URL = "https://rules.emergingthreats.net/blockrules/compromised-ips.txt"
+CINS_ARMY_URL = "http://cinsscore.com/list/ci-badguys.txt"
+
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
+ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
 CACHE_TTL_SECONDS = 300  # Refresh cache every 5 minutes
 CLOUDFLARE_CACHE_TTL_SECONDS = 3600  # Cache Cloudflare data for 1 hour
 ABUSEIPDB_CACHE_TTL_SECONDS = 1800  # Cache AbuseIPDB data for 30 minutes (rate limit protection)
@@ -372,6 +386,121 @@ class ThreatFeedService:
         sample_size = min(count, len(self._cache.indicators))
         return random.sample(self._cache.indicators, sample_size)
 
+    async def _fetch_abuseipdb_single(self, ip: str, api_key: str) -> dict | None:
+        """
+        Fetch reputation data for a single IP from the AbuseIPDB check endpoint.
+
+        Args:
+            ip: The IP address to look up.
+            api_key: AbuseIPDB API key.
+
+        Returns:
+            Dict with reputation fields, or None on failure.
+        """
+        client = await self._get_client()
+
+        headers = {
+            "Key": api_key,
+            "Accept": "application/json",
+        }
+        params = {
+            "ipAddress": ip,
+            "maxAgeInDays": 90,
+            "verbose": "",
+        }
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await client.get(
+                    ABUSEIPDB_CHECK_URL, headers=headers, params=params
+                )
+                response.raise_for_status()
+                data = response.json().get("data", {})
+
+                return {
+                    "ip": data.get("ipAddress", ip),
+                    "abuse_score": int(data.get("abuseConfidenceScore", 0)),
+                    "country_code": data.get("countryCode"),
+                    "isp": data.get("isp"),
+                    "domain": data.get("domain"),
+                    "total_reports": int(data.get("totalReports", 0)),
+                    "source": "abuseipdb",
+                }
+
+            except httpx.TimeoutException:
+                logger.warning(
+                    f"Timeout fetching AbuseIPDB check for {ip} (attempt {attempt + 1})"
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    f"HTTP {e.response.status_code} from AbuseIPDB check for {ip}"
+                )
+                if e.response.status_code in (401, 429):
+                    break  # Don't retry auth / rate-limit errors
+                if e.response.status_code >= 500 and attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+                else:
+                    break
+
+            except httpx.RequestError as e:
+                logger.error(f"Request error checking AbuseIPDB for {ip}: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+
+        return None
+
+    async def get_ip_reputation(
+        self, ip: str, db: AsyncSession, api_key: str | None = None
+    ) -> dict | None:
+        """
+        Look up IP reputation using a "DB-only" strategy.
+
+        Queries the ip_reputation table for a cached record. Does NOT make
+        individual API calls to AbuseIPDB — use refresh_abuseipdb_blacklist()
+        to bulk-populate the cache instead.
+
+        The caller is responsible for committing the session.
+
+        Args:
+            ip: IP address to look up.
+            db: An async SQLAlchemy session.
+            api_key: Ignored (kept for API compatibility).
+
+        Returns:
+            Dict with reputation fields, or None if not in DB.
+        """
+        # Query the database cache
+        result = await db.execute(select(IPReputation).where(IPReputation.ip == ip))
+        cached: IPReputation | None = result.scalar_one_or_none()
+
+        if cached is not None:
+            # Return cached data regardless of freshness
+            # (Bulk refresh handles keeping data current)
+            is_fresh = cached.is_fresh(7)
+            logger.debug(
+                f"IP reputation {'HIT' if is_fresh else 'HIT (stale)'} for {ip} "
+                f"(score={cached.abuse_score})"
+            )
+            return {
+                "ip": cached.ip,
+                "abuse_score": cached.abuse_score,
+                "country_code": cached.country_code,
+                "isp": cached.isp,
+                "domain": cached.domain,
+                "total_reports": cached.total_reports,
+                "source": cached.source,
+                "last_fetched": cached.last_fetched.isoformat(),
+                "from_cache": True,
+                "stale": not is_fresh,
+            }
+
+        # No record in DB — do not make individual API call
+        logger.debug(f"IP reputation MISS for {ip} (not in bulk cache)")
+        return None
+
     @property
     def cache_stats(self) -> dict:
         """Get cache statistics."""
@@ -414,6 +543,220 @@ async def get_real_threat_ips(count: int = 10) -> list[ThreatIndicator]:
         await service.refresh_cache()
 
     return await service.get_indicators(count=count)
+
+
+async def refresh_abuseipdb_blacklist() -> int:
+    """
+    Bulk fetch high-confidence malicious IPs from AbuseIPDB blacklist.
+
+    This function downloads up to 10,000 IPs with confidence >= 90 and
+    upserts them into the ip_reputation table. This bulk approach saves
+    API credits compared to individual lookups during ingestion.
+
+    Returns:
+        Number of IP reputation records upserted to the database.
+    """
+    if not ABUSEIPDB_API_KEY:
+        logger.warning("ABUSEIPDB_API_KEY not set, skipping blacklist refresh")
+        return 0
+
+    logger.info("Fetching AbuseIPDB blacklist (bulk)...")
+
+    headers = {
+        "Key": ABUSEIPDB_API_KEY,
+        "Accept": "application/json",
+    }
+    params = {
+        "confidenceMinimum": 90,
+        "limit": 10000,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.get(
+                ABUSEIPDB_BLACKLIST_URL,
+                headers=headers,
+                params=params,
+            )
+            response.raise_for_status()
+            data = response.json()
+            ip_list = data.get("data", [])
+
+            if not ip_list:
+                logger.warning("AbuseIPDB blacklist returned no data")
+                return 0
+
+            logger.info(f"Received {len(ip_list)} IPs from AbuseIPDB blacklist")
+
+            # Upsert records into the database
+            count = 0
+            async with async_session_maker() as session:
+                for entry in ip_list:
+                    ip = entry.get("ipAddress", "").strip()
+                    if not ip:
+                        continue
+
+                    reputation = IPReputation(
+                        ip=ip,
+                        abuse_score=int(entry.get("abuseConfidenceScore", 0)),
+                        country_code=entry.get("countryCode"),
+                        isp=entry.get("isp"),
+                        domain=entry.get("domain"),
+                        total_reports=int(entry.get("totalReports", 0)),
+                        source="abuseipdb",
+                        last_fetched=datetime.now(UTC),
+                    )
+                    await session.merge(reputation)
+                    count += 1
+
+                await session.commit()
+                logger.info(f"Upserted {count} IPs to ip_reputation table")
+
+            return count
+
+    except httpx.TimeoutException:
+        logger.error("Timeout fetching AbuseIPDB blacklist")
+        return 0
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP {e.response.status_code} from AbuseIPDB blacklist")
+        if e.response.status_code == 429:
+            logger.warning("AbuseIPDB rate limit exceeded")
+        return 0
+    except httpx.RequestError as e:
+        logger.error(f"Request error fetching AbuseIPDB blacklist: {e}")
+        return 0
+    except Exception as e:
+        logger.error(f"Unexpected error fetching AbuseIPDB blacklist: {e}")
+        return 0
+
+
+async def fetch_free_blocklists() -> set[str]:
+    """
+    Fetch IPs from multiple free, high-quality blocklists.
+
+    Sources:
+    - Spamhaus DROP/EDROP (known malicious netblocks)
+    - Emerging Threats compromised IPs
+    - CINS Army bad guys list
+
+    Returns:
+        Set of unique IP addresses (deduplicated).
+    """
+    ips: set[str] = set()
+
+    blocklists = [
+        ("Spamhaus DROP", SPAMHAUS_DROP_URL),
+        ("Spamhaus EDROP", SPAMHAUS_EDROP_URL),
+        ("Emerging Threats", EMERGING_THREATS_URL),
+        ("CINS Army", CINS_ARMY_URL),
+    ]
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        for list_name, url in blocklists:
+            try:
+                logger.info(f"Fetching {list_name} blocklist...")
+                response = await client.get(url)
+                response.raise_for_status()
+                content = response.text
+
+                list_ips = set()
+                for line in content.splitlines():
+                    line = line.strip()
+
+                    # Skip empty lines and comments
+                    if not line or line.startswith("#") or line.startswith(";"):
+                        continue
+
+                    # Extract IP address:
+                    # - Handle CIDR notation (192.168.1.0/24) -> take base IP
+                    # - Handle inline comments (192.168.1.1 ; comment)
+                    # - Split on whitespace, /, or ;
+                    parts = line.split()
+                    if not parts:
+                        continue
+
+                    ip_candidate = parts[0]  # First token is usually the IP
+
+                    # Remove CIDR suffix if present
+                    if "/" in ip_candidate:
+                        ip_candidate = ip_candidate.split("/")[0]
+
+                    # Remove inline comment separator if present
+                    if ";" in ip_candidate:
+                        ip_candidate = ip_candidate.split(";")[0]
+
+                    ip_candidate = ip_candidate.strip()
+
+                    # Basic validation: check if it looks like an IP
+                    if ip_candidate and "." in ip_candidate:
+                        # Simple check: has dots and no alphabetic chars
+                        if not any(c.isalpha() for c in ip_candidate):
+                            list_ips.add(ip_candidate)
+
+                logger.info(f"{list_name}: fetched {len(list_ips)} unique IPs")
+                ips.update(list_ips)
+
+            except httpx.TimeoutException:
+                logger.warning(f"Timeout fetching {list_name} blocklist")
+            except httpx.HTTPStatusError as e:
+                logger.warning(
+                    f"HTTP {e.response.status_code} from {list_name} blocklist"
+                )
+            except httpx.RequestError as e:
+                logger.warning(f"Request error fetching {list_name}: {e}")
+            except Exception as e:
+                logger.warning(f"Unexpected error fetching {list_name}: {e}")
+
+    logger.info(f"Total unique IPs from free blocklists: {len(ips)}")
+    return ips
+
+
+async def refresh_free_blocklists() -> int:
+    """
+    Fetch IPs from free blocklists and save them to the database.
+
+    This function aggregates IPs from multiple free, high-quality threat
+    intelligence sources and upserts them into the ip_reputation table.
+    These lists are high-confidence (abuse_score=95) and require no API key.
+
+    Returns:
+        Number of IP reputation records upserted to the database.
+    """
+    logger.info("Refreshing free blocklists...")
+
+    try:
+        # Fetch IPs from all free blocklists
+        ips = await fetch_free_blocklists()
+
+        if not ips:
+            logger.warning("No IPs fetched from free blocklists")
+            return 0
+
+        # Upsert records into the database
+        count = 0
+        async with async_session_maker() as session:
+            for ip in ips:
+                reputation = IPReputation(
+                    ip=ip,
+                    abuse_score=95,  # High-confidence lists
+                    country_code=None,  # Free lists don't provide geo data
+                    isp=None,
+                    domain=None,
+                    total_reports=0,  # Free lists don't provide report counts
+                    source="free_blocklist",
+                    last_fetched=datetime.now(UTC),
+                )
+                await session.merge(reputation)
+                count += 1
+
+            await session.commit()
+            logger.info(f"Upserted {count} IPs from free blocklists to ip_reputation table")
+
+        return count
+
+    except Exception as e:
+        logger.error(f"Unexpected error refreshing free blocklists: {e}")
+        return 0
 
 
 async def fetch_cloudflare_targets() -> list[tuple[str, float]]:
