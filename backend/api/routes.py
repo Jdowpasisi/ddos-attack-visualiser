@@ -4,15 +4,17 @@ API routes for DDoS Attack Map visualization.
 Provides endpoints optimized for frontend Globe/Map visualization.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import AttackEvent
+from models import AttackEvent, IPReputation
+from config import EVENTS_PER_POLL
+from services.briefing import generate_threat_briefing
 
 # Create router with prefix
 router = APIRouter(prefix="/api/v1", tags=["attacks"])
@@ -87,18 +89,6 @@ class LiveAttacksResponse(BaseModel):
     last_updated: datetime
 
 
-class AttackStatsResponse(BaseModel):
-    """Attack statistics response."""
-
-    total_attacks: int
-    attacks_by_type: dict[str, int]
-    attacks_by_severity: dict[str, int]
-    average_severity: float
-    average_packet_rate: float
-    top_source_countries: list[dict]
-    top_target_countries: list[dict]
-
-
 def attack_to_arc(event: AttackEvent) -> dict:
     """Convert AttackEvent to arc visualization format."""
     # Stroke width based on packet rate (normalized)
@@ -168,16 +158,20 @@ async def get_attacks_since(
 
     Args:
         since_id: Only return attacks with ID greater than this (default: 0).
-        limit: Maximum number of attacks to return.
+        limit: Maximum number of attacks to return (ignored - capped by EVENTS_PER_POLL).
 
     Returns:
-        New attacks since the given ID, sorted chronologically (oldest first).
+        New attacks since the given ID, sorted chronologically (oldest first),
+        with backlog information.
     """
+    # Apply rate limiting - use EVENTS_PER_POLL as hard limit
+    effective_limit = EVENTS_PER_POLL
+    
     query = (
         select(AttackEvent)
         .where(AttackEvent.id > since_id)
         .order_by(AttackEvent.timestamp.asc())  # Chronological order
-        .limit(limit)
+        .limit(effective_limit)
     )
 
     result = await db.execute(query)
@@ -188,70 +182,126 @@ async def get_attacks_since(
     # Get the max ID for next poll
     latest_id = max((a["id"] for a in attacks), default=since_id)
 
+    # Count backlog (remaining events not yet delivered)
+    backlog_query = select(func.count(AttackEvent.id)).where(AttackEvent.id > latest_id)
+    backlog_result = await db.execute(backlog_query)
+    backlog_count = backlog_result.scalar() or 0
+
     return {
         "count": len(attacks),
         "attacks": attacks,
         "latest_id": latest_id,
-        "has_more": len(attacks) == limit,  # Indicates if there might be more data
+        "has_more": len(attacks) == effective_limit,  # Indicates if there might be more data
+        "backlog": backlog_count,  # Number of events still waiting to be delivered
     }
 
 
-@router.get("/attacks/stats", response_model=AttackStatsResponse)
+@router.get("/attacks/stats")
 async def get_attack_statistics(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get aggregated attack statistics.
+    Get aggregated attack statistics for the dashboard.
 
-    Returns:
-        Summary statistics for dashboard display.
+    Computes windowed metrics (5-minute current vs 5-minute previous),
+    top countries, top attack types, severity averages, and peak rate.
     """
-    # Total count
-    total_query = select(func.count(AttackEvent.id))
-    total_result = await db.execute(total_query)
-    total_count = total_result.scalar() or 0
+    now = datetime.now(UTC)
+    t_5m = now - timedelta(minutes=5)
+    t_10m = now - timedelta(minutes=10)
+    t_1m = now - timedelta(minutes=1)
 
-    # Count by attack type
-    type_query = select(
-        AttackEvent.attack_type, func.count(AttackEvent.id).label("count")
-    ).group_by(AttackEvent.attack_type)
-    type_result = await db.execute(type_query)
-    attacks_by_type = {row.attack_type: row.count for row in type_result}
-
-    # Count by severity bands
-    severity_bands = {"low": 0, "medium": 0, "high": 0, "critical": 0}
-
-    for band, (low, high) in [
-        ("low", (0, 3)),
-        ("medium", (3, 6)),
-        ("high", (6, 8)),
-        ("critical", (8, 10)),
-    ]:
-        band_query = select(func.count(AttackEvent.id)).where(
-            AttackEvent.severity_score >= low,
-            AttackEvent.severity_score < high
-            if band != "critical"
-            else AttackEvent.severity_score <= 10,
-        )
-        band_result = await db.execute(band_query)
-        severity_bands[band] = band_result.scalar() or 0
-
-    # Average severity and packet rate
-    avg_query = select(func.avg(AttackEvent.severity_score), func.avg(AttackEvent.packet_rate))
-    avg_result = await db.execute(avg_query)
-    avg_row = avg_result.one()
-    avg_severity = float(avg_row[0] or 0)
-    avg_packet_rate = float(avg_row[1] or 0)
-
-    return AttackStatsResponse(
-        total_attacks=total_count,
-        attacks_by_type=attacks_by_type,
-        attacks_by_severity=severity_bands,
-        average_severity=round(avg_severity, 2),
-        average_packet_rate=round(avg_packet_rate, 0),
-        top_source_countries=[],  # Would need geo data stored
-        top_target_countries=[],
+    # --- Event counts for current and previous 5-min windows ---
+    current_count_q = select(func.count(AttackEvent.id)).where(
+        AttackEvent.timestamp >= t_5m
     )
+    prev_count_q = select(func.count(AttackEvent.id)).where(
+        AttackEvent.timestamp >= t_10m,
+        AttackEvent.timestamp < t_5m,
+    )
+    current_result, prev_result = await db.execute(current_count_q), await db.execute(prev_count_q)
+    current_count: int = current_result.scalar() or 0
+    prev_count: int = prev_result.scalar() or 0
+
+    # Trend percentage (guard against division by zero)
+    trend_pct: float = 0.0
+    if prev_count > 0:
+        trend_pct = round(((current_count - prev_count) / prev_count) * 100, 1)
+
+    # Events per minute in the current 5-min window
+    events_per_min = round(current_count / 5, 1)
+
+    # --- Top 3 countries (join IPReputation on source_ip) ---
+    top_countries_q = (
+        select(
+            IPReputation.country_code,
+            func.count(AttackEvent.id).label("cnt"),
+        )
+        .join(IPReputation, AttackEvent.source_ip == IPReputation.ip)
+        .where(AttackEvent.timestamp >= t_5m)
+        .group_by(IPReputation.country_code)
+        .order_by(desc("cnt"))
+        .limit(3)
+    )
+    top_countries_result = await db.execute(top_countries_q)
+    top_countries = [
+        {"country": row.country_code or "--", "count": row.cnt}
+        for row in top_countries_result
+    ]
+
+    # --- Top 3 attack types ---
+    top_types_q = (
+        select(
+            AttackEvent.attack_type,
+            func.count(AttackEvent.id).label("cnt"),
+            func.avg(AttackEvent.severity_score).label("avg_sev"),
+        )
+        .where(AttackEvent.timestamp >= t_5m)
+        .group_by(AttackEvent.attack_type)
+        .order_by(desc("cnt"))
+        .limit(3)
+    )
+    top_types_result = await db.execute(top_types_q)
+    top_attack_types = [
+        {
+            "type": row.attack_type,
+            "count": row.cnt,
+            "avg_severity": round(float(row.avg_sev or 0), 1),
+        }
+        for row in top_types_result
+    ]
+
+    # --- Average severity for 1-min and 5-min windows ---
+    avg_1m_q = select(func.avg(AttackEvent.severity_score)).where(
+        AttackEvent.timestamp >= t_1m
+    )
+    avg_5m_q = select(func.avg(AttackEvent.severity_score)).where(
+        AttackEvent.timestamp >= t_5m
+    )
+    avg_1m_result, avg_5m_result = await db.execute(avg_1m_q), await db.execute(avg_5m_q)
+    avg_severity_1m = round(float(avg_1m_result.scalar() or 0), 1)
+    avg_severity_5m = round(float(avg_5m_result.scalar() or 0), 1)
+
+    # --- Peak packet rate in 5-min window ---
+    peak_q = select(func.max(AttackEvent.packet_rate)).where(
+        AttackEvent.timestamp >= t_5m
+    )
+    peak_result = await db.execute(peak_q)
+    peak_packet_rate: int = peak_result.scalar() or 0
+
+    return {
+        "window_minutes": 5,
+        "current_count": current_count,
+        "prev_count": prev_count,
+        "trend_pct": trend_pct,
+        "events_per_min": events_per_min,
+        "top_countries": top_countries,
+        "top_attack_types": top_attack_types,
+        "avg_severity_1m": avg_severity_1m,
+        "avg_severity_5m": avg_severity_5m,
+        "peak_packet_rate": peak_packet_rate,
+        "generated_at": now.isoformat(),
+    }
 
 
 @router.get("/attacks/{attack_id}")
@@ -281,4 +331,47 @@ async def get_attack_detail(
         **attack_to_arc(event),
         "source_ip": event.source_ip,
         "target_ip": event.target_ip,
+    }
+
+
+async def _event_with_country(event: AttackEvent, db: AsyncSession) -> dict:
+    """Convert an AttackEvent to a dict enriched with country_code from IPReputation."""
+    country = None
+    rep = await db.get(IPReputation, event.source_ip)
+    if rep:
+        country = rep.country_code
+    return {
+        "attack_type": event.attack_type,
+        "severity_score": event.severity_score,
+        "packet_rate": event.packet_rate,
+        "source_country": country or "??",
+        "timestamp": event.timestamp.isoformat() if event.timestamp else "",
+    }
+
+
+@router.get("/intel/briefing")
+async def get_threat_briefing(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generate an AI-powered threat intelligence briefing from recent events.
+
+    Returns a concise 3-sentence analysis produced by the Groq LLM.
+    """
+    query = (
+        select(AttackEvent)
+        .order_by(AttackEvent.timestamp.desc())
+        .limit(20)
+    )
+    result = await db.execute(query)
+    events = result.scalars().all()
+
+    event_dicts = [await _event_with_country(e, db) for e in events]
+
+    briefing = await generate_threat_briefing(event_dicts)
+
+    return {
+        "briefing": briefing,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "event_count": len(event_dicts),
     }

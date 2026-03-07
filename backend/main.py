@@ -24,6 +24,14 @@ from models import AttackEvent, IPReputation  # noqa: F401
 from services.feeds import refresh_abuseipdb_blacklist, refresh_free_blocklists
 from services.ingest import ingest_threats
 
+# Import configuration constants
+from config import (
+    INGESTION_INTERVAL_SECONDS,
+    INGESTION_BATCH_SIZE,
+    BLACKLIST_REFRESH_HOURS,
+    EVENTS_PER_POLL,
+)
+
 # Load environment variables
 load_dotenv()
 
@@ -32,11 +40,6 @@ _ingestion_task: asyncio.Task | None = None
 _blacklist_task: asyncio.Task | None = None
 _free_list_task: asyncio.Task | None = None
 _stop_ingestion = False
-
-# Configuration from environment
-INGESTION_INTERVAL_SECONDS = int(os.getenv("INGESTION_INTERVAL_SECONDS", "10"))
-INGESTION_BATCH_SIZE = int(os.getenv("INGESTION_BATCH_SIZE", "5"))
-BLACKLIST_REFRESH_HOURS = 24  # Refresh AbuseIPDB blacklist every 24 hours
 
 
 async def background_ingestion_loop():

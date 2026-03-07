@@ -46,7 +46,9 @@ services:
       # Ingestion settings
       INGESTION_INTERVAL_SECONDS: "10"
       INGESTION_BATCH_SIZE: "5"
+      DISPLAY_RATE_PER_SECOND: ${DISPLAY_RATE_PER_SECOND:-3}
       
+      # GROQ_API_KEY is loaded via env_file (backend/.env)
       # Geo service backend (ip-api for real coordinates)
       GEO_BACKEND: ip-api
     ports:

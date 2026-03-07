@@ -1,4 +1,8 @@
-import React, { useMemo } from 'react';
+// CyberDashboard.tsx 
+import React, { useMemo, useState, useEffect } from 'react';
+import ArcDetailPanel from './ArcDetailPanel';
+import BriefingPanel from './BriefingPanel';
+import StatsPanel from './StatsPanel';
 
 // ============ Types ============
 export interface ThreatEvent {
@@ -10,11 +14,46 @@ export interface ThreatEvent {
   country?: string;
 }
 
+export interface StreamEntry {
+  key: string;           // Unique ID: "sourceIp|attackType"
+  sourceIp: string;
+  attackType: string;
+  severity: number;
+  packetRate: number;
+  hitCount: number;      // How many times this specific pattern occurred
+  firstSeenAt: number;
+  lastSeenAt: number;
+  isNew: boolean;        // For animation
+}
+
+export interface AttackStats {
+  window_minutes: number;
+  current_count: number;
+  prev_count: number;
+  trend_pct: number;
+  events_per_min: number;
+  top_countries: { country: string; count: number }[];
+  top_attack_types: { type: string; count: number; avg_severity: number }[];
+  avg_severity_1m: number;
+  avg_severity_5m: number;
+  peak_packet_rate: number;
+  generated_at: string;
+}
+
 export interface DashboardProps {
   threats: ThreatEvent[];
+  arcs?: import('./AttackGlobe').GlobeArc[];
+  stats?: AttackStats | null;
   totalEvents: number;
+  arcCount?: number;
+  arcMax?: number;
   isLive: boolean;
   error: string | null;
+  backlog: number;
+  isPaused?: boolean;
+  onTogglePause?: () => void;
+  selectedArc?: import('./AttackGlobe').GlobeArc | null;
+  onDeselectArc?: () => void;
 }
 
 // ============ Utility Functions ============
@@ -40,36 +79,71 @@ const getThreatLevelInfo = (avgSeverity: number): { level: string; color: string
   return { level: 'CRITICAL', color: 'bg-red-500', percent: Math.min(100, avgSeverity * 10) };
 };
 
-const formatTime = (timestamp: string): string => {
-  const date = new Date(timestamp);
-  return date.toLocaleTimeString('en-US', { 
-    hour12: false, 
-    hour: '2-digit', 
-    minute: '2-digit', 
-    second: '2-digit' 
-  });
-};
-
 const truncateIp = (ip: string): string => {
+  const parts = ip.split('.');
+  if (parts.length === 4) {
+    return `${parts[0]}.${parts[1]}.x.${parts[3]}`;
+  }
   if (ip.length <= 15) return ip;
   return ip.substring(0, 12) + '...';
 };
 
+const formatTimeAgo = (timestamp: number): string => {
+  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
+};
+
+type AttackArc = import('./AttackGlobe').GlobeArc;
+
+export const aggregateThreats = (
+  prev: StreamEntry[],
+  incoming: AttackArc[],
+): StreamEntry[] => {
+  const map = new Map<string, StreamEntry>();
+  for (const entry of prev) {
+    map.set(entry.key, { ...entry, isNew: false });
+  }
+
+  const now = Date.now();
+  for (const attack of incoming) {
+    const key = `${attack.data.sourceIp}|${attack.data.attackType}`;
+    const existing = map.get(key);
+    if (existing) {
+      existing.hitCount += 1;
+      existing.lastSeenAt = Math.max(existing.lastSeenAt, attack.lastHitAt || now);
+      existing.severity = Math.max(existing.severity, attack.data.severity);
+      existing.packetRate = Math.max(existing.packetRate, attack.data.packetRate);
+      existing.isNew = false;
+    } else {
+      map.set(key, {
+        key,
+        sourceIp: attack.data.sourceIp,
+        attackType: attack.data.attackType,
+        severity: attack.data.severity,
+        packetRate: attack.data.packetRate,
+        hitCount: 1,
+        firstSeenAt: attack.lastHitAt || now,
+        lastSeenAt: attack.lastHitAt || now,
+        isNew: true,
+      });
+    }
+  }
+
+  return Array.from(map.values())
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+    .slice(0, 12);
+};
+
 // ============ Live Threat Stream Component ============
 interface LiveThreatStreamProps {
-  threats: ThreatEvent[];
-  maxItems?: number;
+  entries: StreamEntry[];
 }
 
-export const LiveThreatStream: React.FC<LiveThreatStreamProps> = ({ 
-  threats, 
-  maxItems = 5 
-}) => {
-  const recentThreats = useMemo(() => 
-    threats.slice(0, maxItems), 
-    [threats, maxItems]
-  );
-
+export const LiveThreatStream: React.FC<LiveThreatStreamProps> = ({ entries }) => {
   return (
     <div className="glass-card cyber-glow p-4 w-72 md:w-80 max-w-[90vw]">
       {/* Header */}
@@ -81,53 +155,67 @@ export const LiveThreatStream: React.FC<LiveThreatStreamProps> = ({
       </div>
 
       {/* Threat List */}
-      <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar">
-        {recentThreats.length === 0 ? (
+      <div className="space-y-1.5 max-h-[420px] overflow-y-auto custom-scrollbar">
+        {entries.length === 0 ? (
           <div className="text-gray-500 text-xs mono-text text-center py-4">
             No active threats detected
           </div>
         ) : (
-          recentThreats.map((threat, index) => (
-            <div 
-              key={threat.id}
-              className={`
-                flex items-center justify-between gap-2 p-2 rounded-lg 
-                bg-black/40 border border-gray-700/50
-                hover:border-cyan-500/30 transition-all duration-200
-                animate-slide-up
-              `}
-              style={{ animationDelay: `${index * 50}ms` }}
-            >
-              {/* Left: Time + IP */}
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-gray-500 text-[10px] mono-text">
-                    {formatTime(threat.timestamp)}
-                  </span>
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${getSeverityClass(threat.severity)} bg-current/10`}>
-                    {getSeverityLabel(threat.severity)}
-                  </span>
-                </div>
-                <div className="mono-text text-xs text-gray-300 truncate">
-                  {truncateIp(threat.sourceIp)}
-                </div>
-              </div>
+          entries.map((entry) => {
+            const heatWidth = Math.min(100, Math.log2(entry.hitCount + 1) * 20);
 
-              {/* Right: Attack Type */}
-              <div className="text-right">
-                <span className="text-xs text-cyan-400 mono-text font-medium">
-                  {threat.attackType.replace(/_/g, ' ')}
-                </span>
+            return (
+              <div
+                key={entry.key}
+                className={`
+                  relative flex items-center justify-between gap-2 p-2 rounded-lg
+                  bg-black/40 border border-gray-700/50 overflow-hidden
+                  hover:border-cyan-500/30 transition-all duration-200
+                  ${entry.isNew ? 'animate-slide-up' : ''}
+                `}
+              >
+                {/* Heat bar background */}
+                <div
+                  className={`absolute inset-y-0 left-0 ${getSeverityClass(entry.severity)} opacity-10 transition-all duration-500`}
+                  style={{ width: `${heatWidth}%` }}
+                />
+
+                {/* Left: Severity + IP + Attack Type */}
+                <div className="relative flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${getSeverityClass(entry.severity)} bg-current/10`}>
+                      {getSeverityLabel(entry.severity)}
+                    </span>
+                    <span className="mono-text text-xs text-gray-300 truncate">
+                      {truncateIp(entry.sourceIp)}
+                    </span>
+                  </div>
+                  <div className="text-xs text-cyan-400 mono-text font-medium mt-0.5 truncate">
+                    {entry.attackType.replace(/_/g, ' ')}
+                  </div>
+                </div>
+
+                {/* Right: Hit count + Time ago */}
+                <div className="relative flex flex-col items-end flex-shrink-0">
+                  <span className={`text-[11px] mono-text font-bold ${
+                    entry.hitCount > 20 ? 'text-red-400' : 'text-cyan-400'
+                  }`}>
+                    &times;{entry.hitCount}
+                  </span>
+                  <span className="text-[9px] text-gray-500 mono-text">
+                    {formatTimeAgo(entry.lastSeenAt)}
+                  </span>
+                </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 
       {/* Footer */}
       <div className="mt-3 pt-2 border-t border-gray-700/50 flex justify-between items-center">
         <span className="text-[10px] text-gray-500 mono-text">
-          Showing {recentThreats.length} of {threats.length}
+          {entries.length} aggregated sources
         </span>
         <div className="flex gap-2 text-[10px]">
           <span className="threat-low">●</span>
@@ -336,36 +424,229 @@ export const ErrorBanner: React.FC<ErrorBannerProps> = ({ message }) => (
   </div>
 );
 
+// ============ Backlog Indicator Component ============
+interface BacklogIndicatorProps {
+  backlog: number;
+}
+
+export const BacklogIndicator: React.FC<BacklogIndicatorProps> = ({ backlog }) => {
+  // Don't render if no backlog
+  if (backlog === 0) return null;
+
+  // Determine severity styling
+  const getSeverityStyle = () => {
+    if (backlog > 100) {
+      return {
+        borderColor: 'border-red-500/50',
+        bgColor: 'bg-red-900/20',
+        textColor: 'text-red-400',
+        iconColor: 'text-red-500',
+        pulseClass: 'animate-pulse',
+        label: 'CRITICAL'
+      };
+    } else if (backlog > 30) {
+      return {
+        borderColor: 'border-orange-500/50',
+        bgColor: 'bg-orange-900/20',
+        textColor: 'text-orange-400',
+        iconColor: 'text-orange-500',
+        pulseClass: '',
+        label: 'HIGH'
+      };
+    } else {
+      return {
+        borderColor: 'border-yellow-500/50',
+        bgColor: 'bg-yellow-900/20',
+        textColor: 'text-yellow-400',
+        iconColor: 'text-yellow-500',
+        pulseClass: '',
+        label: 'MODERATE'
+      };
+    }
+  };
+
+  const style = getSeverityStyle();
+
+  return (
+    <div className={`glass-card ${style.borderColor} ${style.bgColor} p-3 max-w-xs ${style.pulseClass}`}>
+      <div className="flex items-center gap-2">
+        <svg className={`w-4 h-4 ${style.iconColor} flex-shrink-0`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} 
+            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" 
+          />
+        </svg>
+        <div className="flex-1">
+          <div className={`text-xs mono-text ${style.textColor} font-medium`}>
+            ⚠ {backlog} EVENTS QUEUED
+          </div>
+          <div className="text-[9px] text-gray-500 mono-text uppercase">
+            {style.label} BACKLOG
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ============ Arc Capacity Indicator Component ============
+const ArcCapacityIndicator: React.FC<{ count: number; max: number }> = ({ count, max }) => {
+  const pct = max > 0 ? count / max : 0;
+
+  let barColor: string;
+  let textColor: string;
+  let label: string | null = null;
+  let pulse = false;
+  let warning: string | null = null;
+
+  if (pct >= 1.0) {
+    barColor = 'bg-red-500';
+    textColor = 'text-red-400';
+    label = 'SATURATED';
+    pulse = true;
+    warning = 'Oldest arcs cycling off';
+  } else if (pct >= 0.75) {
+    barColor = 'bg-orange-500';
+    textColor = 'text-orange-400';
+    label = 'HIGH';
+  } else if (pct >= 0.4) {
+    barColor = 'bg-cyan-500';
+    textColor = 'text-cyan-400';
+  } else {
+    barColor = 'bg-green-500';
+    textColor = 'text-green-400';
+  }
+
+  return (
+    <div className="glass-card p-3 min-w-[160px]">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="text-[9px] text-gray-500 mono-text uppercase tracking-widest">Arc Capacity</span>
+        {label && (
+          <span className={`text-[9px] mono-text font-bold ${textColor} ${pulse ? 'animate-pulse' : ''}`}>
+            {label}
+          </span>
+        )}
+      </div>
+
+      {/* Progress bar */}
+      <div className="relative h-1.5 bg-gray-800 rounded-full overflow-hidden mb-1.5">
+        <div
+          className={`h-full rounded-full transition-all duration-500 ${barColor}`}
+          style={{ width: `${Math.min(100, pct * 100)}%` }}
+        />
+      </div>
+
+      {/* Footer */}
+      <div className="flex items-center justify-between">
+        <span className={`text-[10px] mono-text font-bold ${textColor}`}>
+          {count} / {max}
+        </span>
+        {warning && (
+          <span className="text-[9px] mono-text text-red-400/80">
+            {warning}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ============ Pause Button Component ============
+const PauseButton: React.FC<{
+  isPaused: boolean;
+  onToggle: () => void;
+}> = ({ isPaused, onToggle }) => (
+  <button
+    onClick={onToggle}
+    className={`
+      mt-2 w-full py-1.5 rounded-lg border backdrop-blur-md
+      text-[10px] font-bold tracking-widest uppercase transition-all
+      ${
+        isPaused
+          ? 'border-red-500/50 bg-red-900/40 text-red-400 shadow-[0_0_10px_rgba(239,68,68,0.3)] animate-pulse'
+          : 'border-cyan-500/30 bg-black/40 text-cyan-400 hover:bg-cyan-900/20 hover:border-cyan-400/50'
+      }
+    `}
+  >
+    {isPaused ? '\u25b6 RESUME SYSTEM' : '\u23f8 PAUSE STREAM'}
+  </button>
+);
+
 // ============ Main Dashboard Overlay Component ============
 export const CyberDashboard: React.FC<DashboardProps> = ({ 
   threats, 
-  totalEvents, 
+  arcs = [],
+  stats,
+  totalEvents,
+  arcCount = 0,
+  arcMax = 100,
   isLive, 
-  error 
+  error,
+  backlog,
+  isPaused = false,
+  onTogglePause,
+  selectedArc = null,
+  onDeselectArc,
 }) => {
+  const [streamEntries, setStreamEntries] = useState<StreamEntry[]>([]);
+
+  useEffect(() => {
+    if (!isPaused && arcs.length > 0) {
+      setStreamEntries(prev => aggregateThreats(prev, arcs));
+    }
+  }, [arcs, isPaused]);
+
   return (
     <>
       {/* Top Left: Live Threat Stream */}
       <div className="absolute top-4 left-4 z-10 md:top-6 md:left-6">
-        <LiveThreatStream threats={threats} maxItems={5} />
+        <LiveThreatStream entries={streamEntries} />
+        
+        {/* Backlog Indicator (below threat stream) */}
+        <div className="mt-2">
+          <BacklogIndicator backlog={backlog} />
+        </div>
       </div>
 
-      {/* Top Right: Total Events Counter */}
-      <div className="absolute top-4 right-4 z-10 md:top-6 md:right-6">
-        <TotalEventsCounter count={totalEvents} isLive={isLive} />
-        
-        {/* Error Banner (below counter if error exists) */}
-        {error && (
-          <div className="mt-2">
-            <ErrorBanner message={error} />
-          </div>
+      {/* Top Right: Total Events & Controls */}
+      <div className="absolute top-4 right-4 z-10 md:top-6 md:right-6 flex flex-col gap-2 w-64 md:w-72">
+        <TotalEventsCounter count={totalEvents} isLive={isLive && !isPaused} />
+
+        {/* Error Banner */}
+        {error && <ErrorBanner message={error} />}
+
+        {/* Pause Button */}
+        {onTogglePause && (
+          <PauseButton isPaused={!!isPaused} onToggle={onTogglePause} />
         )}
+
+        {/* Arc Capacity */}
+        <ArcCapacityIndicator count={arcCount} max={arcMax} />
+      </div>
+
+      {/* Bottom Left: Detail Panel or Server Status */}
+      <div className="absolute bottom-4 left-4 z-10 md:bottom-6 md:left-6">
+        {selectedArc && onDeselectArc ? (
+          <ArcDetailPanel arc={selectedArc} onClose={onDeselectArc} />
+        ) : null}
       </div>
 
       {/* Bottom Right: Global Threat Level */}
       <div className="absolute bottom-4 right-4 z-10 md:bottom-6 md:right-6">
         <ThreatLevelGauge threats={threats} />
       </div>
+
+      {/* Top Center: AI Briefing */}
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 pointer-events-auto">
+        <BriefingPanel />
+      </div>
+
+      {/* Bottom Center: Stats Panel */}
+      {stats && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10">
+          <StatsPanel stats={stats} />
+        </div>
+      )}
     </>
   );
 };

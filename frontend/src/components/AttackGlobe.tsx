@@ -1,6 +1,9 @@
+// AttackGlobe.tsx
+
 import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import Globe, { GlobeMethods } from 'react-globe.gl';
-import { CyberDashboard, ServerStatus, ThreatEvent } from './CyberDashboard';
+import { CyberDashboard, ServerStatus, ThreatEvent, AttackStats } from './CyberDashboard';
+import { MAX_ARCS, ARC_TTL_MS, FETCH_INTERVAL_MS, STATS_INTERVAL_MS } from '../constants';
 
 // Types for attack data from API
 interface AttackArc {
@@ -24,6 +27,7 @@ interface StreamResponse {
   attacks: AttackArc[];
   latest_id: number;
   has_more: boolean;
+  backlog: number;
 }
 
 // Fixed "My Server" coordinates (US - Ashburn, Virginia - major data center hub)
@@ -35,17 +39,9 @@ const MY_SERVER_COORDS = {
 
 // API Configuration - uses environment variable with fallback
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const FETCH_INTERVAL_MS = 5000;
-
-// Arc TTL (Time To Live) in milliseconds - attacks fade after this time
-// Increased to keep attacks visible longer (5 minutes)
-const ARC_TTL_MS = 300000; // 5 minutes (300 seconds)
-
-// Maximum number of arcs to keep in state
-const MAX_ARCS = 100;
 
 // Arc data structure for Globe
-interface GlobeArc {
+export interface GlobeArc {
   startLat: number;
   startLng: number;
   endLat: number;
@@ -54,6 +50,8 @@ interface GlobeArc {
   stroke: number;
   label: string;
   data: AttackArc;
+  hitCount: number;       // Number of aggregated events
+  lastHitAt: number;      // Timestamp of most recent hit (ms)
 }
 
 // Severity to color mapping
@@ -78,6 +76,25 @@ const getSeverityColor = (severity: number): string => {
   }
 };
 
+// Aggregation helper functions
+
+// Unique key for an attack pattern
+const arcKey = (attack: AttackArc): string =>
+  `${attack.sourceIp}|${attack.targetIp}|${attack.attackType}`;
+
+// Calculate visual weight based on repetition
+const getStrokeWidth = (hitCount: number, severity: number): number => {
+  const base = 0.5 + (severity / 10) * 1.5;
+  const hitBonus = Math.min(Math.log2(hitCount) * 0.4, 2.0);
+  return Math.min(base + hitBonus, 4.0);
+};
+
+// Calculate color intensity based on aggregation
+const getAggregatedColor = (severity: number, hitCount: number): string => {
+  const effectiveSeverity = Math.min(10, severity + Math.log2(hitCount) * 0.8);
+  return getSeverityColor(effectiveSeverity);
+};
+
 // Main AttackGlobe component
 const AttackGlobe: React.FC = () => {
   const globeRef = useRef<GlobeMethods>(null!);
@@ -85,6 +102,10 @@ const AttackGlobe: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [latestId, setLatestId] = useState(0);
+  const [backlog, setBacklog] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [selectedArc, setSelectedArc] = useState<GlobeArc | null>(null);
+  const [stats, setStats] = useState<AttackStats | null>(null);
 
   // Convert AttackArc to GlobeArc
   const mapToGlobeArc = useCallback((attack: AttackArc): GlobeArc => ({
@@ -93,21 +114,22 @@ const AttackGlobe: React.FC = () => {
     endLat: MY_SERVER_COORDS.lat,
     endLng: MY_SERVER_COORDS.lon,
     color: getSeverityColor(attack.severity),
-    stroke: Math.max(0.5, Math.min(3, attack.strokeWidth)),
-    label: `${attack.attackType} | ${attack.sourceIp} → ${attack.targetIp} | Severity: ${attack.severity}`,
+    stroke: getStrokeWidth(1, attack.severity),
+    label: `${attack.attackType} · ${attack.sourceIp} → ${attack.targetIp} · 1 hit · Severity ${attack.severity}`,
     data: {
       ...attack,
       // Use current time for TTL calculation so attacks appear "live"
       timestamp: new Date().toISOString(),
     },
+    hitCount: 1,
+    lastHitAt: Date.now(),
   }), []);
 
   // Filter out expired arcs based on TTL
   const filterActiveArcs = useCallback((arcs: GlobeArc[]): GlobeArc[] => {
     const now = Date.now();
     return arcs.filter((arc) => {
-      const attackTime = new Date(arc.data.timestamp).getTime();
-      return (now - attackTime) < ARC_TTL_MS;
+      return (now - arc.lastHitAt) < ARC_TTL_MS;
     });
   }, []);
 
@@ -132,29 +154,55 @@ const AttackGlobe: React.FC = () => {
         setLatestId(data.latest_id);
       }
       
+      // Update backlog count
+      setBacklog(data.backlog ?? 0);
+      
       // Map new attacks to Globe arc format
       const newArcs: GlobeArc[] = data.attacks.map(mapToGlobeArc);
       
-      // Merge with existing arcs, apply TTL filter, and limit count
+      // Merge with existing arcs using aggregation
       setArcsData((prevArcs) => {
-        // Combine existing (filtered by TTL) with new arcs
-        const existingActive = filterActiveArcs(prevArcs);
-        const combined = [...existingActive, ...newArcs];
-        
-        // Deduplicate by attack ID
-        const uniqueArcs = combined.reduce((acc, arc) => {
-          if (!acc.some((a) => a.data.id === arc.data.id)) {
-            acc.push(arc);
+        const now = Date.now();
+        const arcMap = new Map<string, GlobeArc>();
+
+        // 1. Keep existing valid arcs
+        filterActiveArcs(prevArcs).forEach(arc => {
+          arcMap.set(arcKey(arc.data), arc);
+        });
+
+        // 2. Merge new attacks
+        newArcs.forEach((incoming) => {
+          const key = arcKey(incoming.data);
+          const existing = arcMap.get(key);
+
+          if (existing) {
+            // Update in place
+            const newCount = existing.hitCount + 1;
+            arcMap.set(key, {
+              ...existing,
+              hitCount: newCount,
+              lastHitAt: now,
+              stroke: getStrokeWidth(newCount, incoming.data.severity),
+              color: getAggregatedColor(incoming.data.severity, newCount),
+              label: `${incoming.data.attackType} · ${incoming.data.sourceIp} → ${incoming.data.targetIp} · ${newCount} hits · Severity ${incoming.data.severity}`,
+            });
+          } else {
+            // Create new
+            arcMap.set(key, {
+              ...mapToGlobeArc(incoming.data),
+              hitCount: 1,
+              lastHitAt: now,
+            });
           }
-          return acc;
-        }, [] as GlobeArc[]);
-        
-        // Limit to MAX_ARCS, keeping newest
-        const sorted = uniqueArcs.sort((a, b) => 
-          new Date(b.data.timestamp).getTime() - new Date(a.data.timestamp).getTime()
-        );
-        
-        return sorted.slice(0, MAX_ARCS);
+        });
+
+        // 3. Sort by visual weight (severity * hits) and slice
+        return Array.from(arcMap.values())
+          .sort((a, b) =>
+            (b.data.severity * Math.log(b.hitCount + 1)) -
+            (a.data.severity * Math.log(a.hitCount + 1))
+          )
+          .slice(0, MAX_ARCS);
       });
       
       setError(null);
@@ -166,8 +214,29 @@ const AttackGlobe: React.FC = () => {
     }
   }, [latestId, mapToGlobeArc, filterActiveArcs]);
 
+  // Fetch attack stats from API
+  const fetchStats = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/attacks/stats`);
+      if (!response.ok) throw new Error(`Stats HTTP ${response.status}`);
+      const data: AttackStats = await response.json();
+      setStats(data);
+    } catch (err) {
+      console.error('Failed to fetch attack stats:', err);
+    }
+  }, []);
+
+  // Stats polling (every 30s)
+  useEffect(() => {
+    fetchStats();
+    const id = setInterval(fetchStats, STATS_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [fetchStats]);
+
   // Initial fetch and interval setup
   useEffect(() => {
+    if (isPaused) return;
+
     // Initial fetch
     fetchLiveAttacks();
     
@@ -176,16 +245,18 @@ const AttackGlobe: React.FC = () => {
     
     // Cleanup on unmount
     return () => clearInterval(intervalId);
-  }, [fetchLiveAttacks]);
+  }, [fetchLiveAttacks, isPaused]);
 
   // Periodic TTL cleanup - remove expired arcs every second
   useEffect(() => {
+    if (isPaused) return;
+
     const cleanupInterval = setInterval(() => {
       setArcsData((prevArcs) => filterActiveArcs(prevArcs));
     }, 1000);
     
     return () => clearInterval(cleanupInterval);
-  }, [filterActiveArcs]);
+  }, [filterActiveArcs, isPaused]);
 
   // Memoized active arcs for rendering (already filtered, but ensures freshness)
   const activeArcs = useMemo(() => filterActiveArcs(arcsData), [arcsData, filterActiveArcs]);
@@ -252,8 +323,26 @@ const AttackGlobe: React.FC = () => {
         arcStartLng={(d) => (d as GlobeArc).startLng}
         arcEndLat={(d) => (d as GlobeArc).endLat}
         arcEndLng={(d) => (d as GlobeArc).endLng}
-        arcColor={(d) => (d as GlobeArc).color}
-        arcStroke={(d) => (d as GlobeArc).stroke}
+        arcColor={(d) => {
+          const arc = d as GlobeArc;
+          if (selectedArc && arcKey(selectedArc.data) !== arcKey(arc.data)) {
+            return arc.color + '40';
+          }
+          return arc.color;
+        }}
+        arcStroke={(d) => {
+          const arc = d as GlobeArc;
+          if (selectedArc && arcKey(selectedArc.data) === arcKey(arc.data)) {
+            return arc.stroke * 2;
+          }
+          return arc.stroke;
+        }}
+        onArcClick={(d) => {
+          const arc = d as GlobeArc;
+          setSelectedArc((prev) =>
+            prev && arcKey(prev.data) === arcKey(arc.data) ? null : arc
+          );
+        }}
         arcDashLength={0.5}
         arcDashGap={0.2}
         arcDashAnimateTime={2000}
@@ -285,19 +374,43 @@ const AttackGlobe: React.FC = () => {
       {/* Cyber Threat Intelligence Dashboard */}
       <CyberDashboard
         threats={threatEvents}
+        arcs={activeArcs}
+        stats={stats}
+        backlog={backlog}
         totalEvents={activeArcs.length}
+        arcCount={arcsData.length}
+        arcMax={MAX_ARCS}
         isLive={!isLoading && !error}
         error={error}
+        isPaused={isPaused}
+        onTogglePause={() => setIsPaused((p) => !p)}
+        selectedArc={selectedArc}
+        onDeselectArc={() => setSelectedArc(null)}
       />
 
-      {/* Server Location Info */}
-      <div className="absolute bottom-4 left-4 z-10 md:bottom-6 md:left-6">
-        <ServerStatus
-          label={MY_SERVER_COORDS.label}
-          lat={MY_SERVER_COORDS.lat}
-          lon={MY_SERVER_COORDS.lon}
+      {/* Paused state full-screen border overlay */}
+      {isPaused && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 25,
+            pointerEvents: 'none',
+            border: '2px solid rgba(239,68,68,0.45)',
+          }}
         />
-      </div>
+      )}
+
+      {/* Server Location Info (hidden when arc detail panel is shown) */}
+      {!selectedArc && (
+        <div className="absolute bottom-4 left-4 z-10 md:bottom-6 md:left-6">
+          <ServerStatus
+            label={MY_SERVER_COORDS.label}
+            lat={MY_SERVER_COORDS.lat}
+            lon={MY_SERVER_COORDS.lon}
+          />
+        </div>
+      )}
     </div>
   );
 };
