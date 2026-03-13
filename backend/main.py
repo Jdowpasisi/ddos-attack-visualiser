@@ -202,19 +202,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Build explicit CORS origin list for local + production frontends.
-_cors_origins = [
-    "http://localhost:3000",
-    "https://ddos-attack-map.vercel.app",
-]
-_frontend_url = os.getenv("FRONTEND_URL", "").strip()
-if _frontend_url:
-    _cors_origins.append(_frontend_url)
-
 # Configure CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
+    allow_origins=["*"],  # Configure appropriately for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -225,7 +216,7 @@ app.include_router(api_router)
 
 
 @app.get("/")
-async def health():
+async def root():
     """Health check endpoint."""
     return {
         "status": "ok",
