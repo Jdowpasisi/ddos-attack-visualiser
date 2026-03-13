@@ -4,7 +4,7 @@ SQLAlchemy models for the DDoS Attack Map application.
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Float, Integer, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -45,6 +45,9 @@ class AttackEvent(Base):
     attack_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     packet_rate: Mapped[int] = mapped_column(Integer, nullable=False)
     severity_score: Mapped[float] = mapped_column(Float, nullable=False)
+    is_simulated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, index=True
+    )
 
     def __repr__(self) -> str:
         return (
@@ -98,4 +101,70 @@ class IPReputation(Base):
             f"<IPReputation(ip='{self.ip}', "
             f"abuse_score={self.abuse_score}, "
             f"source='{self.source}')>"
+        )
+
+
+class IncidentReport(Base):
+    """
+    AI-generated incident report synthesised from attack event data and tool outputs.
+
+    Attributes:
+        id: Primary key, auto-incremented.
+        attack_event_id: Foreign key referencing the originating AttackEvent.
+        source_ip: IP address of the attack source (denormalised for fast access).
+        attack_type: Type of DDoS attack at time of report generation.
+        severity_score: Severity score recorded at time of report generation (0.0 - 10.0).
+        ip_reputation_summary: Raw output from the IP-reputation tool.
+        cve_findings: Raw output from the CVE / vulnerability-lookup tool.
+        trend_context: Raw output from the threat-trend context tool.
+        threat_level: Agent-assigned threat level (e.g. 'low', 'medium', 'high', 'critical').
+        summary: Narrative summary produced by the agent.
+        recommended_action: Actionable recommendation produced by the agent.
+        tools_called: Comma-separated list of tool names invoked during synthesis.
+        generated_at: UTC timestamp of when this report was created.
+    """
+
+    __tablename__ = "incident_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    attack_event_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("attack_events.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Denormalised attack context
+    source_ip: Mapped[str] = mapped_column(String(45), nullable=False, index=True)
+    attack_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    severity_score: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Tool outputs
+    ip_reputation_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cve_findings: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trend_context: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Agent synthesis
+    threat_level: Mapped[str] = mapped_column(String(20), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    recommended_action: Mapped[str] = mapped_column(Text, nullable=False)
+    is_repeat_attacker: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    campaign_detected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pattern_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Metadata
+    tools_called: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<IncidentReport(id={self.id}, "
+            f"attack_event_id={self.attack_event_id}, "
+            f"threat_level='{self.threat_level}', "
+            f"generated_at='{self.generated_at}')>"
         )

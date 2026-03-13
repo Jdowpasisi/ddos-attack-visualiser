@@ -6,6 +6,8 @@ scores it using the ML model, and persists to the database.
 """
 
 import asyncio
+import json
+import logging
 import os
 import random
 import sys
@@ -23,9 +25,22 @@ sys.path.insert(0, str(backend_dir))
 # Load environment variables
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+from agents.threat_investigator import investigate_threat  # noqa: E402
+from api.routes import attack_to_arc, get_connection_manager  # noqa: E402
 from database import async_session_maker  # noqa: E402
-from ml.predictor import Protocol, predict_threat  # noqa: E402
-from models import AttackEvent  # noqa: E402
+from ml.predictor import Protocol, score_threat  # noqa: E402
+from models import AttackEvent, IncidentReport  # noqa: E402
+
+try:
+    from groq import RateLimitError as GroqRateLimitError
+    from groq import AuthenticationError as GroqAuthError
+    from groq import APIConnectionError as GroqConnectionError
+except ImportError:  # pragma: no cover
+    GroqRateLimitError = Exception  # type: ignore[assignment,misc]
+    GroqAuthError = Exception       # type: ignore[assignment,misc]
+    GroqConnectionError = Exception # type: ignore[assignment,misc]
 from services.feeds import (  # noqa: E402
     ThreatIndicator,
     fetch_abuseipdb_threats,
@@ -40,6 +55,137 @@ from services.geo import (  # noqa: E402
 
 # Thread pool for CPU-bound ML inference (prevents blocking async event loop)
 _ml_thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ml_inference")
+
+# Severity threshold above which an autonomous investigation is triggered
+INVESTIGATION_THRESHOLD: float = float(os.getenv("INVESTIGATION_THRESHOLD", "8.0"))
+
+# Minimum seconds between consecutive investigations (rate-limit guard)
+INVESTIGATION_COOLDOWN_SECONDS: float = float(os.getenv("INVESTIGATION_COOLDOWN_SECONDS", "60"))
+_last_investigation_at: float = 0.0  # module-level timestamp
+
+
+def classify_severity(score: float, is_repeat: bool) -> str:
+    """Fallback programmatic classification if LLM fails to provide a valid threat_level."""
+    if score >= 8:   base = 'CRITICAL'
+    elif score >= 6: base = 'HIGH'
+    elif score >= 4: base = 'MEDIUM'
+    else:            base = 'LOW'
+
+    if not is_repeat:
+        return base
+
+    # Apply escalation for repeat attackers
+    tier = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
+    return tier[min(tier.index(base) + 1, 3)]
+
+
+async def _run_and_store_investigation(event_id: int, event_data: dict) -> None:
+    """
+    Background task: run the threat investigator agent and persist the result
+    as an IncidentReport row.
+
+    Designed to be launched with asyncio.create_task so it never blocks the
+    ingestion pipeline.
+    """
+    try:
+        report = await investigate_threat(event_data)
+    except GroqRateLimitError as exc:
+        logger.warning(
+            "Groq rate limit hit for event %d — storing placeholder report. %s",
+            event_id, exc,
+        )
+        report = {
+            "threat_level": "high",
+            "summary": (
+                f"Investigation rate-limited by Groq API. "
+                f"Attack: {event_data.get('attack_type')} from "
+                f"{event_data.get('source_ip')} "
+                f"(severity {event_data.get('severity_score', '?')}). "
+                "Manual review recommended."
+            ),
+            "recommended_action": "Review manually — AI analysis unavailable due to API quota.",
+            "tools_called": None,
+        }
+    except GroqAuthError as exc:
+        logger.error(
+            "Groq authentication failed for event %d — check GROQ_API_KEY. %s",
+            event_id, exc,
+        )
+        report = {
+            "threat_level": "unknown",
+            "summary": (
+                f"Investigation failed: Groq API key invalid or unauthorised. "
+                f"Attack: {event_data.get('attack_type')} from "
+                f"{event_data.get('source_ip')}. Verify GROQ_API_KEY in .env."
+            ),
+            "recommended_action": "Check GROQ_API_KEY is valid and not expired.",
+            "tools_called": None,
+        }
+    except GroqConnectionError as exc:
+        logger.error(
+            "Groq connection error for event %d: %s", event_id, exc,
+        )
+        report = {
+            "threat_level": "unknown",
+            "summary": (
+                f"Investigation failed: cannot reach Groq API. "
+                f"Attack: {event_data.get('attack_type')} from "
+                f"{event_data.get('source_ip')}."
+            ),
+            "recommended_action": "Check network connectivity and Groq API status.",
+            "tools_called": None,
+        }
+    except Exception as exc:
+        logger.error(
+            "Threat investigation failed for event %d: %s", event_id, exc, exc_info=True
+        )
+        return
+
+    # Safely extract and validate the threat level
+    raw_threat_level = report.get("threat_level", "UNKNOWN").upper()
+    is_repeat = report.get("is_repeat_attacker", False)
+
+    if raw_threat_level not in ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL'):
+        print(f"[Investigator] Invalid or missing threat level '{raw_threat_level}', applying fallback classification.")
+        validated_threat_level = classify_severity(event_data["severity_score"], is_repeat)
+    else:
+        validated_threat_level = raw_threat_level
+
+    try:
+        async with async_session_maker() as session:
+            incident = IncidentReport(
+                attack_event_id=event_id,
+                source_ip=event_data["source_ip"],
+                attack_type=event_data["attack_type"],
+                severity_score=event_data["severity_score"],
+                ip_reputation_summary=json.dumps(report.get("ip_reputation_summary"))
+                if report.get("ip_reputation_summary") is not None
+                else None,
+                cve_findings=json.dumps(report.get("cve_findings"))
+                if report.get("cve_findings") is not None
+                else None,
+                trend_context=json.dumps(report.get("trend_context"))
+                if report.get("trend_context") is not None
+                else None,
+                threat_level=validated_threat_level,
+                summary=report.get("summary", ""),
+                recommended_action=report.get("recommended_action", ""),
+                is_repeat_attacker=bool(report.get("is_repeat_attacker", False)),
+                campaign_detected=bool(report.get("campaign_detected", False)),
+                pattern_summary=report.get("pattern_summary") or None,
+                tools_called=report.get("tools_called"),
+            )
+            session.add(incident)
+            await session.commit()
+            logger.info(
+                "IncidentReport created for AttackEvent %d (threat_level=%s)",
+                event_id,
+                incident.threat_level,
+            )
+    except Exception as exc:
+        logger.error(
+            "Failed to persist IncidentReport for event %d: %s", event_id, exc, exc_info=True
+        )
 
 
 # Attack type definitions with associated protocols
@@ -402,18 +548,20 @@ async def fetch_live_threats(count: int = 10, use_real_feeds: bool = None) -> li
                 threats.append(threat)
                 await asyncio.sleep(0.01)  # Vary timestamps
 
-            # HYBRID FALLBACK: Pad with mock data if real feeds are limited
-            MIN_THREATS_FOR_DEMO = 20
-            if len(threats) < MIN_THREATS_FOR_DEMO:
-                padding_needed = MIN_THREATS_FOR_DEMO - len(threats)
+            # Check if we need to pad with simulated events
+            MIN_REAL_EVENTS_PER_BATCH = int(os.getenv("MIN_REAL_EVENTS_PER_BATCH", "5"))
+
+            if len(threats) < MIN_REAL_EVENTS_PER_BATCH:
+                padding_needed = MIN_REAL_EVENTS_PER_BATCH - len(threats)
                 print(
-                    f"  [HYBRID] Feed limit reached. Padding with {padding_needed} simulated events for demo."
+                    f"  [HYBRID] {len(threats)} real events this cycle — padding with {padding_needed} simulated to reach minimum batch size."
                 )
                 for _ in range(padding_needed):
                     mock_threat = generate_mock_threat(target_weights)
-                    mock_threat["is_simulated"] = True  # Mark as simulated
+                    mock_threat["is_simulated"] = True
                     threats.append(mock_threat)
-                    await asyncio.sleep(0.01)
+            else:
+                print(f"  [REAL] {len(threats)} live threat events — no padding needed.")
 
             return threats
         else:
@@ -467,39 +615,6 @@ async def enrich_threat_with_geo(threat: dict, geo_service: GeoService) -> dict:
     return threat
 
 
-def score_threat(threat: dict) -> float:
-    """
-    Score the threat using the ML model (synchronous, CPU-bound).
-
-    Args:
-        threat: Threat dictionary with packet_rate and protocol_id.
-
-    Returns:
-        Severity score between 0 and 10.
-    """
-    # Get probability from ML model (0-1)
-    probability = predict_threat(
-        packet_rate=threat["packet_rate"], protocol_id=threat["protocol_id"]
-    )
-
-    # Calculate rate bonus based on packet rate
-    packet_rate = threat["packet_rate"]
-    if packet_rate > 100000:
-        rate_bonus = min(2.0, (packet_rate - 100000) / 200000 * 2)
-    elif packet_rate > 50000:
-        rate_bonus = 1.0
-    elif packet_rate > 20000:
-        rate_bonus = 0.5
-    else:
-        rate_bonus = 0.0
-
-    # Convert to severity score (0-10)
-    base_score = probability * 8.0  # Base score up to 8
-    severity_score = min(10.0, base_score + rate_bonus)
-
-    return round(severity_score, 2)
-
-
 async def score_threat_async(threat: dict) -> float:
     """
     Async wrapper for ML scoring - runs in thread pool to avoid blocking.
@@ -512,7 +627,10 @@ async def score_threat_async(threat: dict) -> float:
 
 
 async def process_and_store_threat(
-    threat: dict, db_session: AsyncSession, geo_service: GeoService
+    threat: dict,
+    db_session: AsyncSession,
+    geo_service: GeoService,
+    pending_investigations: list | None = None,
 ) -> AttackEvent:
     """
     Process a single threat: enrich, score, and store.
@@ -585,9 +703,52 @@ async def process_and_store_threat(
         attack_type=enriched["attack_type"],
         packet_rate=enriched["packet_rate"],
         severity_score=severity_score,
+        is_simulated=threat.get("is_simulated", False),
     )
 
     db_session.add(attack_event)
+    await db_session.flush()  # Populate attack_event.id without committing
+
+    try:
+        arc_data = attack_to_arc(attack_event)
+        manager = get_connection_manager()
+        asyncio.create_task(manager.broadcast({"type": "attack", "attack": arc_data, "backlog": 0}))
+    except Exception as _ws_exc:
+        logger.debug("WebSocket broadcast skipped: %s", _ws_exc)
+
+    if attack_event.severity_score >= INVESTIGATION_THRESHOLD:
+        if pending_investigations is not None:
+            # Collect candidate; the batch loop will pick the worst one later.
+            pending_investigations.append((attack_event.id, {
+                "source_ip": attack_event.source_ip,
+                "target_ip": attack_event.target_ip,
+                "attack_type": attack_event.attack_type,
+                "severity_score": attack_event.severity_score,
+                "packet_rate": attack_event.packet_rate,
+                "timestamp": attack_event.timestamp.isoformat(),
+            }))
+        else:
+            import time as _time
+            global _last_investigation_at
+            now_ts = _time.monotonic()
+            if now_ts - _last_investigation_at >= INVESTIGATION_COOLDOWN_SECONDS:
+                _last_investigation_at = now_ts
+                event_data = {
+                    "source_ip": attack_event.source_ip,
+                    "target_ip": attack_event.target_ip,
+                    "attack_type": attack_event.attack_type,
+                    "severity_score": attack_event.severity_score,
+                    "packet_rate": attack_event.packet_rate,
+                    "timestamp": attack_event.timestamp.isoformat(),
+                }
+                asyncio.create_task(
+                    _run_and_store_investigation(attack_event.id, event_data)
+                )
+                logger.info(
+                    "Investigation queued for AttackEvent %d (severity=%.2f)",
+                    attack_event.id,
+                    attack_event.severity_score,
+                )
 
     return attack_event
 
@@ -669,10 +830,14 @@ async def ingest_threats(count: int = 10, use_real_feeds: bool = None) -> list[A
             threat["target_geo"] = _batch_geo_cache.get(threat["target_ip"])
 
         # Process each threat (using cached data)
+        pending_investigations: list[tuple[int, dict]] = []
         for threat in threats:
             try:
                 event = await process_and_store_threat(
-                    threat=threat, db_session=session, geo_service=geo_service
+                    threat=threat,
+                    db_session=session,
+                    geo_service=geo_service,
+                    pending_investigations=pending_investigations,
                 )
                 created_events.append(event)
 
@@ -684,14 +849,42 @@ async def ingest_threats(count: int = 10, use_real_feeds: bool = None) -> list[A
             except Exception as e:
                 print(f"  Error processing threat: {e}")
 
-        # Commit all events
+        # Commit all events — attack_events rows now exist in the DB
         await session.commit()
 
         # Refresh to get IDs
         for event in created_events:
             await session.refresh(event)
 
+    # Fire investigation tasks only after commit so the FK is satisfied.
+    # Pick only the single highest-severity event from this batch to avoid
+    # flooding the Groq API and ensure the agent sees the worst offender.
+    if pending_investigations:
+        import time as _time
+        global _last_investigation_at
+        now_ts = _time.monotonic()
+        if now_ts - _last_investigation_at >= INVESTIGATION_COOLDOWN_SECONDS:
+            _last_investigation_at = now_ts
+            best_id, best_data = max(
+                pending_investigations,
+                key=lambda t: t[1]["severity_score"],
+            )
+            asyncio.create_task(_run_and_store_investigation(best_id, best_data))
+            logger.info(
+                "Investigation queued for AttackEvent %d (severity=%.2f, batch candidates=%d)",
+                best_id, best_data["severity_score"], len(pending_investigations),
+            )
+        else:
+            remaining = INVESTIGATION_COOLDOWN_SECONDS - (now_ts - _last_investigation_at)
+            logger.debug(
+                "Investigation skipped for entire batch — cooldown active (%.0fs remaining)",
+                remaining,
+            )
+
     print(f"\nIngested {len(created_events)} attack events.")
+    if pending_investigations:
+        print(f"  Queued {len(pending_investigations)} investigation task(s).")
+
 
     return created_events
 

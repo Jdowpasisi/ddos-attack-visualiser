@@ -1,8 +1,12 @@
 // CyberDashboard.tsx 
 import React, { useMemo, useState, useEffect } from 'react';
 import ArcDetailPanel from './ArcDetailPanel';
+import AgentStatusWidget from './AgentStatusWidget';
+import { ArcLegend } from './ArcLegend';
 import BriefingPanel from './BriefingPanel';
+import IncidentsPanel from './IncidentsPanel';
 import StatsPanel from './StatsPanel';
+import { useDashboard } from '../context/DashboardContext';
 
 // ============ Types ============
 export interface ThreatEvent {
@@ -54,6 +58,7 @@ export interface DashboardProps {
   onTogglePause?: () => void;
   selectedArc?: import('./AttackGlobe').GlobeArc | null;
   onDeselectArc?: () => void;
+  serverStatus?: { label: string; lat: number; lon: number };
 }
 
 // ============ Utility Functions ============
@@ -113,11 +118,15 @@ export const aggregateThreats = (
     const key = `${attack.data.sourceIp}|${attack.data.attackType}`;
     const existing = map.get(key);
     if (existing) {
-      existing.hitCount += 1;
-      existing.lastSeenAt = Math.max(existing.lastSeenAt, attack.lastHitAt || now);
-      existing.severity = Math.max(existing.severity, attack.data.severity);
-      existing.packetRate = Math.max(existing.packetRate, attack.data.packetRate);
-      existing.isNew = false;
+      map.set(key, {
+        ...existing,
+        hitCount: existing.hitCount + 1,
+        lastSeenAt: now,
+        // KEY FIX: Only keep the highest severity and rate
+        severity: Math.max(existing.severity, attack.data.severity),
+        packetRate: Math.max(existing.packetRate, attack.data.packetRate),
+        isNew: false,
+      });
     } else {
       map.set(key, {
         key,
@@ -144,6 +153,14 @@ interface LiveThreatStreamProps {
 }
 
 export const LiveThreatStream: React.FC<LiveThreatStreamProps> = ({ entries }) => {
+  // Force a re-render every second so the "time ago" timestamps tick up dynamically
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <div className="glass-card cyber-glow p-4 w-72 md:w-80 max-w-[90vw]">
       {/* Header */}
@@ -325,6 +342,9 @@ export const ThreatLevelGauge: React.FC<ThreatLevelGaugeProps> = ({ threats }) =
         `}>
           {threatInfo.level}
         </span>
+        <span className="block text-gray-500 text-[10px] uppercase tracking-widest mt-0.5">
+          active arcs · last 30s
+        </span>
       </div>
 
       {/* Progress Bar */}
@@ -369,7 +389,8 @@ export const ThreatLevelGauge: React.FC<ThreatLevelGaugeProps> = ({ threats }) =
           <div className="text-lg font-bold digital-text text-cyan-400">
             {avgSeverity.toFixed(1)}
           </div>
-          <div className="text-[9px] text-gray-500 mono-text">AVG SEVERITY</div>
+          <div className="text-[9px] text-gray-500 mono-text">THREAT INDEX</div>
+          <div className="text-[8px] text-gray-600 mono-text">active arc weighted avg</div>
         </div>
         <div>
           <div className="text-lg font-bold digital-text text-cyan-400">
@@ -551,6 +572,38 @@ const ArcCapacityIndicator: React.FC<{ count: number; max: number }> = ({ count,
   );
 };
 
+// ============ WebSocket Status Indicator Component ============
+const WsStatusIndicator: React.FC = () => {
+  const { wsStatus } = useDashboard();
+
+  const config = {
+    connected: {
+      dot: 'bg-green-500 animate-pulse',
+      text: 'text-green-400',
+      label: 'LIVE',
+    },
+    connecting: {
+      dot: 'bg-yellow-500 animate-pulse',
+      text: 'text-yellow-400',
+      label: 'CONNECTING',
+    },
+    disconnected: {
+      dot: 'bg-red-500',
+      text: 'text-red-400',
+      label: 'RECONNECTING',
+    },
+  }[wsStatus];
+
+  return (
+    <div className="glass-card p-2 px-3 flex items-center gap-2">
+      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${config.dot}`} />
+      <span className={`digital-text text-[9px] uppercase tracking-widest ${config.text}`}>
+        {config.label}
+      </span>
+    </div>
+  );
+};
+
 // ============ Pause Button Component ============
 const PauseButton: React.FC<{
   isPaused: boolean;
@@ -576,7 +629,6 @@ const PauseButton: React.FC<{
 export const CyberDashboard: React.FC<DashboardProps> = ({ 
   threats, 
   arcs = [],
-  stats,
   totalEvents,
   arcCount = 0,
   arcMax = 100,
@@ -587,6 +639,7 @@ export const CyberDashboard: React.FC<DashboardProps> = ({
   onTogglePause,
   selectedArc = null,
   onDeselectArc,
+  serverStatus,
 }) => {
   const [streamEntries, setStreamEntries] = useState<StreamEntry[]>([]);
 
@@ -624,16 +677,29 @@ export const CyberDashboard: React.FC<DashboardProps> = ({
         <ArcCapacityIndicator count={arcCount} max={arcMax} />
       </div>
 
-      {/* Bottom Left: Detail Panel or Server Status */}
-      <div className="absolute bottom-4 left-4 z-10 md:bottom-6 md:left-6">
-        {selectedArc && onDeselectArc ? (
-          <ArcDetailPanel arc={selectedArc} onClose={onDeselectArc} />
-        ) : null}
+      {/* Bottom Left: Incidents Panel */}
+      <div className="absolute bottom-4 left-4 z-20 md:bottom-6 md:left-6 flex flex-col gap-2 items-start">
+        <IncidentsPanel />
+        {serverStatus && (
+          <ServerStatus
+            label={serverStatus.label}
+            lat={serverStatus.lat}
+            lon={serverStatus.lon}
+          />
+        )}
       </div>
 
-      {/* Bottom Right: Global Threat Level */}
-      <div className="absolute bottom-4 right-4 z-10 md:bottom-6 md:right-6">
+      {/* Bottom Right: Attack Details (when arc selected) + Agent Status + Global Threat Level + Sync */}
+      <div className="absolute bottom-4 right-4 z-20 md:bottom-6 md:right-6 flex flex-col gap-2 items-end">
+        {selectedArc && onDeselectArc && (
+          <ArcDetailPanel arc={selectedArc} onClose={onDeselectArc} />
+        )}
+        <div className="pointer-events-auto w-64 md:w-72">
+          <AgentStatusWidget />
+        </div>
+        <ArcLegend />
         <ThreatLevelGauge threats={threats} />
+        <WsStatusIndicator />
       </div>
 
       {/* Top Center: AI Briefing */}
@@ -642,11 +708,9 @@ export const CyberDashboard: React.FC<DashboardProps> = ({
       </div>
 
       {/* Bottom Center: Stats Panel */}
-      {stats && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10">
-          <StatsPanel stats={stats} />
-        </div>
-      )}
+      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10">
+        <StatsPanel />
+      </div>
     </>
   );
 };

@@ -52,6 +52,7 @@ ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
 CACHE_TTL_SECONDS = 300  # Refresh cache every 5 minutes
 CLOUDFLARE_CACHE_TTL_SECONDS = 3600  # Cache Cloudflare data for 1 hour
 ABUSEIPDB_CACHE_TTL_SECONDS = 1800  # Cache AbuseIPDB data for 30 minutes (rate limit protection)
+ABUSEIPDB_FETCH_SIZE = 500        # Always fetch this many from AbuseIPDB to build a rich cache pool
 REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2.0
@@ -892,33 +893,69 @@ def _get_default_target_distribution() -> list[tuple[str, float]]:
 
 async def fetch_abuseipdb_threats(api_key: str, limit: int = 50) -> list[ThreatIndicator]:
     """
-    Fetch high-confidence threat indicators from AbuseIPDB with caching.
+    Fetch high-confidence threat indicators from AbuseIPDB.
 
-    Uses the blacklist endpoint to get IPs with confidenceMinimum=90.
-    Cache TTL: 30 minutes to avoid rate limit (1000 requests/day free tier).
+    Priority order to minimise API credit consumption:
+    1. In-memory cache (valid for 30 min, reset on restart)
+    2. DB-backed ip_reputation table (persistent across restarts)
+    3. Live AbuseIPDB blacklist API call (last resort, populates both caches)
 
     Args:
         api_key: AbuseIPDB API key.
-        limit: Maximum number of IPs to fetch (max 10000).
+        limit: Number of indicators to return.
 
     Returns:
         List of ThreatIndicators from AbuseIPDB.
     """
     global _abuseipdb_cache
 
-    # Check cache first
+    # --- 1. In-memory cache (fast path) ---
     async with _abuseipdb_lock:
         if _abuseipdb_cache.is_valid:
             logger.info(
                 f"Using cached AbuseIPDB data ({len(_abuseipdb_cache.indicators)} indicators)"
             )
-            # Return random sample from cache
-            import random
-
             cached = _abuseipdb_cache.indicators[:]
             random.shuffle(cached)
             return cached[:limit]
 
+    # --- 2. DB-backed cache (survives container restarts) ---
+    try:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(IPReputation.ip)
+                .where(IPReputation.source == "abuseipdb")
+                .limit(ABUSEIPDB_FETCH_SIZE)
+            )
+            db_ips = [row[0] for row in result.fetchall()]
+
+        if db_ips:
+            logger.info(f"Using {len(db_ips)} AbuseIPDB IPs from DB cache")
+            sampled = random.sample(db_ips, min(limit, len(db_ips)))
+            indicators = [
+                ThreatIndicator(
+                    ip=ip,
+                    port=None,
+                    malware_family=DEFAULT_ABUSEIPDB_ATTACK_TYPE,
+                    source_feed="abuseipdb",
+                )
+                for ip in sampled
+            ]
+            # Warm the in-memory cache so future calls skip the DB too
+            all_indicators = [
+                ThreatIndicator(ip=ip, port=None,
+                                malware_family=DEFAULT_ABUSEIPDB_ATTACK_TYPE,
+                                source_feed="abuseipdb")
+                for ip in db_ips
+            ]
+            async with _abuseipdb_lock:
+                _abuseipdb_cache.indicators = all_indicators
+                _abuseipdb_cache.last_updated = datetime.now(UTC)
+            return indicators
+    except Exception as e:
+        logger.warning(f"DB cache read failed, falling back to API: {e}")
+
+    # --- 3. Live API call (last resort — only when DB is empty) ---
     indicators = []
 
     headers = {
@@ -928,14 +965,14 @@ async def fetch_abuseipdb_threats(api_key: str, limit: int = 50) -> list[ThreatI
 
     params = {
         "confidenceMinimum": 90,
-        "limit": min(limit, 10000),
+        "limit": min(ABUSEIPDB_FETCH_SIZE, 10000),
     }
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         for attempt in range(MAX_RETRIES):
             try:
                 logger.info(
-                    f"Fetching AbuseIPDB blacklist (attempt {attempt + 1}/{MAX_RETRIES})..."
+                    f"Fetching AbuseIPDB blacklist from API (attempt {attempt + 1}/{MAX_RETRIES})..."
                 )
 
                 response = await client.get(
@@ -948,39 +985,36 @@ async def fetch_abuseipdb_threats(api_key: str, limit: int = 50) -> list[ThreatI
                 data = response.json()
                 ip_list = data.get("data", [])
 
-                logger.info(f"Received {len(ip_list)} IPs from AbuseIPDB")
+                logger.info(f"Received {len(ip_list)} IPs from AbuseIPDB API")
 
                 for entry in ip_list:
                     ip = entry.get("ipAddress", "").strip()
                     if not ip:
                         continue
 
-                    # Map categories to attack type
                     categories = entry.get("abuseCategories", []) or []
                     attack_type = DEFAULT_ABUSEIPDB_ATTACK_TYPE
-
                     for cat_id in categories:
                         if cat_id in ABUSEIPDB_CATEGORY_MAPPING:
                             attack_type = ABUSEIPDB_CATEGORY_MAPPING[cat_id]
                             break
 
-                    indicator = ThreatIndicator(
+                    indicators.append(ThreatIndicator(
                         ip=ip,
                         port=None,
-                        malware_family=attack_type,  # Store attack type in malware_family
+                        malware_family=attack_type,
                         first_seen=None,
                         last_online=None,
                         source_feed="abuseipdb",
-                    )
-                    indicators.append(indicator)
+                    ))
 
-                # Update cache with fresh data
+                # Populate in-memory cache
                 async with _abuseipdb_lock:
                     _abuseipdb_cache.indicators = indicators[:]
                     _abuseipdb_cache.last_updated = datetime.now(UTC)
                     logger.info(f"Cached {len(indicators)} AbuseIPDB indicators (TTL: 30min)")
 
-                return indicators
+                return random.sample(indicators, min(limit, len(indicators))) if indicators else []
 
             except httpx.TimeoutException:
                 logger.warning(f"Timeout fetching AbuseIPDB (attempt {attempt + 1})")
@@ -993,7 +1027,7 @@ async def fetch_abuseipdb_threats(api_key: str, limit: int = 50) -> list[ThreatI
                     logger.error("Invalid AbuseIPDB API key")
                     break
                 elif e.response.status_code == 429:
-                    logger.warning("AbuseIPDB rate limit exceeded")
+                    logger.warning("AbuseIPDB rate limit exceeded — will retry from DB next cycle")
                     break
                 elif e.response.status_code >= 500 and attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
@@ -1009,7 +1043,7 @@ async def fetch_abuseipdb_threats(api_key: str, limit: int = 50) -> list[ThreatI
                 logger.error(f"Unexpected error fetching AbuseIPDB: {e}")
                 break
 
-    logger.error("Failed to fetch AbuseIPDB data")
+    logger.error("Failed to fetch AbuseIPDB data from all sources")
     return indicators
 
 

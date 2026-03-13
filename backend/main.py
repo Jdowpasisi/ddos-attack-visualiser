@@ -9,6 +9,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from dotenv import load_dotenv
+
+# Load environment variables FIRST — before any module-level os.getenv() calls
+# (config.py, briefing.py, etc. all read from os.environ at import or call time)
+load_dotenv()
+
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -16,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.routes import router as api_router
-from database import create_tables, get_db
+from database import create_tables, apply_migrations, get_db
 
 # Import all model classes to register them with Base.metadata
 from models import AttackEvent, IPReputation  # noqa: F401
@@ -31,9 +36,6 @@ from config import (
     BLACKLIST_REFRESH_HOURS,
     EVENTS_PER_POLL,
 )
-
-# Load environment variables
-load_dotenv()
 
 # Background task control
 _ingestion_task: asyncio.Task | None = None
@@ -155,7 +157,8 @@ async def lifespan(app: FastAPI):
 
     # Startup: Create tables
     await create_tables()
-    print("Database tables created successfully.")
+    await apply_migrations()
+    print("Database tables created/migrated successfully.")
 
     # Start background ingestion task
     _stop_ingestion = False
@@ -199,10 +202,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Build explicit CORS origin list for local + production frontends.
+_cors_origins = [
+    "http://localhost:3000",
+    "https://ddos-attack-map.vercel.app",
+]
+_frontend_url = os.getenv("FRONTEND_URL", "").strip()
+if _frontend_url:
+    _cors_origins.append(_frontend_url)
+
 # Configure CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -213,7 +225,7 @@ app.include_router(api_router)
 
 
 @app.get("/")
-async def root():
+async def health():
     """Health check endpoint."""
     return {
         "status": "ok",

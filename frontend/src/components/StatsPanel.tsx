@@ -1,9 +1,5 @@
 import React from 'react';
-import type { AttackStats } from './CyberDashboard';
-
-interface StatsPanelProps {
-  stats: AttackStats;
-}
+import { useDashboard } from '../context/DashboardContext';
 
 /** Convert a 2-letter ISO country code to its emoji flag. */
 const countryFlag = (code: string): string => {
@@ -20,7 +16,18 @@ const formatRate = (rate: number): string => {
   return String(rate);
 };
 
-const StatsPanel: React.FC<StatsPanelProps> = ({ stats }) => {
+const StatsPanel: React.FC = () => {
+  const { snapshot } = useDashboard();
+  const stats = snapshot.stats;
+
+  if (!stats) {
+    return (
+      <div className="glass-card cyber-glow p-4 w-64 flex items-center justify-center h-16">
+        <span className="text-[10px] text-gray-500 mono-text animate-pulse">Syncing…</span>
+      </div>
+    );
+  }
+
   const trendUp = stats.trend_pct > 0;
   const trendDown = stats.trend_pct < 0;
   const severityPct = Math.min(100, (stats.avg_severity_1m / 10) * 100);
@@ -72,10 +79,11 @@ const StatsPanel: React.FC<StatsPanelProps> = ({ stats }) => {
 
       {/* ── Severity Bar ── */}
       <div className="mb-3">
-        <div className="flex justify-between text-[9px] text-gray-500 mono-text mb-1">
-          <span>AVG SEVERITY (1 min)</span>
+        <div className="flex justify-between text-[9px] text-gray-500 mono-text mb-0.5">
+          <span>DB AVG SEVERITY</span>
           <span className="text-cyan-400">{stats.avg_severity_1m.toFixed(1)}</span>
         </div>
+        <div className="text-[8px] text-gray-600 mono-text mb-1">from database (1 min)</div>
         <div className="relative h-2 bg-gray-800 rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-500 ${

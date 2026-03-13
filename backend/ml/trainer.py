@@ -1,177 +1,173 @@
-"""
-Training script for DDoS attack classification model.
-
-Generates synthetic traffic data and trains a RandomForestClassifier
-to distinguish between normal traffic and DDoS attacks.
-
-Usage:
-    python trainer.py
-"""
-
+import gc
+import numpy as np
+import pandas as pd
+import joblib
 from pathlib import Path
 
-import joblib
-import numpy as np
+from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
-# Protocol mapping for reference
-PROTOCOLS = {
-    0: "TCP",
-    1: "UDP",
-    2: "ICMP",
-    3: "HTTP",
-    4: "HTTPS",
-    5: "DNS",
+DATA_DIR = Path(__file__).parent / "data"
+
+# Maximum rows kept per class before SMOTE.  Caps memory use while keeping
+# the dataset large enough to be representative.
+MAX_SAMPLES_PER_CLASS = 200_000
+
+FEATURE_COLUMNS = [
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Total Length of Fwd Packets",
+    "Flow Bytes/s",
+    "Flow Packets/s",
+    "Flow IAT Mean",
+    "Fwd PSH Flags",
+]
+
+DDOS_LABELS = {
+    "DDoS",
+    "DoS Hulk",
+    "DoS GoldenEye",
+    "DoS slowloris",
+    "DoS Slowhttptest",
+    "PortScan",
+    "Bot",
 }
 
-# Model output path
-MODEL_DIR = Path(__file__).parent
-MODEL_PATH = MODEL_DIR / "model.pkl"
+
+def load_cicids2017() -> pd.DataFrame:
+    csv_files = list(DATA_DIR.glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found in {DATA_DIR}")
+
+    frames = []
+    for path in csv_files:
+        # Build a case-insensitive, whitespace-stripped map: lower_stripped -> raw
+        raw_cols = pd.read_csv(path, nrows=0).columns.tolist()
+        ci_map = {c.strip().lower(): c for c in raw_cols}
+
+        label_raw = ci_map.get("label")
+        if label_raw is None:
+            raise KeyError(f"No 'Label' column found in {path.name}")
+
+        missing = [f for f in FEATURE_COLUMNS if f.lower() not in ci_map]
+        if missing:
+            raise KeyError(f"Missing columns {missing} in {path.name}")
+
+        use_cols = [ci_map[f.lower()] for f in FEATURE_COLUMNS] + [label_raw]
+
+        df = pd.read_csv(path, usecols=use_cols, low_memory=False)
+
+        # Normalise to canonical names regardless of original casing/spacing
+        rename = {ci_map[f.lower()].strip(): f for f in FEATURE_COLUMNS}
+        rename[label_raw.strip()] = "Label"
+        df.columns = df.columns.str.strip()
+        df.rename(columns=rename, inplace=True)
+
+        frames.append(df)
+        print(f"  Loaded {path.name}: {len(df):,} rows")
+
+    combined = pd.concat(frames, ignore_index=True)
+    del frames
+    gc.collect()
+    return combined
 
 
-def generate_synthetic_data(n_samples: int = 2000, random_state: int = 42) -> tuple:
-    """
-    Generate synthetic network traffic data.
-
-    Args:
-        n_samples: Total number of samples to generate.
-        random_state: Random seed for reproducibility.
-
-    Returns:
-        Tuple of (features, labels) where:
-        - features: numpy array of shape (n_samples, 2) with [packet_rate, protocol_id]
-        - labels: numpy array of shape (n_samples,) with 0=normal, 1=DDoS
-    """
-    np.random.seed(random_state)
-
-    n_normal = n_samples // 2
-    n_ddos = n_samples - n_normal
-
-    # Normal traffic characteristics:
-    # - Low to moderate packet rates (10-500 packets/sec)
-    # - Any protocol, but more HTTP/HTTPS (3, 4)
-    normal_packet_rates = np.random.exponential(scale=100, size=n_normal)
-    normal_packet_rates = np.clip(normal_packet_rates, 10, 500)
-
-    # Normal traffic uses more web protocols
-    normal_protocols = np.random.choice(
-        [0, 1, 2, 3, 4, 5], size=n_normal, p=[0.15, 0.10, 0.05, 0.35, 0.30, 0.05]
+def prepare_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    label_col = next(
+        (c for c in df.columns if c.strip().lower() == "label"),
+        None,
     )
+    if label_col is None:
+        raise KeyError("No 'Label' column found in dataset")
 
-    # DDoS attack characteristics:
-    # - High packet rates (1000-100000 packets/sec)
-    # - Typically UDP (1), ICMP (2), or DNS amplification (5)
-    ddos_packet_rates = np.random.exponential(scale=15000, size=n_ddos)
-    ddos_packet_rates = np.clip(ddos_packet_rates, 1000, 100000)
+    y = df[label_col].str.strip().isin(DDOS_LABELS).astype(np.int8).values
 
-    # DDoS tends to use UDP, ICMP, DNS for amplification attacks
-    ddos_protocols = np.random.choice(
-        [0, 1, 2, 3, 4, 5], size=n_ddos, p=[0.10, 0.35, 0.25, 0.05, 0.05, 0.20]
-    )
+    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing feature columns: {missing}")
 
-    # Combine features
-    normal_features = np.column_stack([normal_packet_rates, normal_protocols])
-    ddos_features = np.column_stack([ddos_packet_rates, ddos_protocols])
+    X = df[FEATURE_COLUMNS].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    valid = X.notna().all(axis=1)
+    X = X[valid]
+    y = y[valid.values]
 
-    features = np.vstack([normal_features, ddos_features])
-
-    # Labels: 0 = normal, 1 = DDoS
-    labels = np.array([0] * n_normal + [1] * n_ddos)
-
-    # Shuffle the data
-    shuffle_idx = np.random.permutation(len(labels))
-    features = features[shuffle_idx]
-    labels = labels[shuffle_idx]
-
-    return features, labels
+    return X.values.astype(np.float32), y
 
 
-def train_model(features: np.ndarray, labels: np.ndarray) -> RandomForestClassifier:
-    """
-    Train a RandomForestClassifier on the provided data.
+def _cap_classes(X: np.ndarray, y: np.ndarray, max_per_class: int) -> tuple[np.ndarray, np.ndarray]:
+    """Randomly downsample each class to at most *max_per_class* rows."""
+    rng = np.random.default_rng(42)
+    keep = []
+    for cls in np.unique(y):
+        idx = np.where(y == cls)[0]
+        if len(idx) > max_per_class:
+            idx = rng.choice(idx, size=max_per_class, replace=False)
+        keep.append(idx)
+    idx_all = np.concatenate(keep)
+    rng.shuffle(idx_all)
+    return X[idx_all], y[idx_all]
 
-    Args:
-        features: Feature matrix of shape (n_samples, 2).
-        labels: Label array of shape (n_samples,).
 
-    Returns:
-        Trained RandomForestClassifier model.
-    """
-    # Split data for training and validation
+def main() -> None:
+    print("Loading CICIDS2017 data …")
+    df = load_cicids2017()
+    print(f"  Total rows loaded: {len(df):,}")
+
+    X, y = prepare_features(df)
+    del df
+    gc.collect()
+    print(f"  Samples after cleaning: {len(X):,}  |  Attack ratio: {y.mean():.2%}")
+
+    # Cap each class before the train/test split to avoid SMOTE OOM
+    X, y = _cap_classes(X, y, MAX_SAMPLES_PER_CLASS)
+    print(f"  After class cap: {len(X):,} samples")
+
     X_train, X_test, y_train, y_test = train_test_split(
-        features, labels, test_size=0.2, random_state=42, stratify=labels
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
+    del X, y
+    gc.collect()
 
-    # Initialize and train the model
-    model = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=10,
-        min_samples_split=5,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1,
-    )
+    print("Applying SMOTE to balance training set …")
+    smote = SMOTE(random_state=42, k_neighbors=3)
+    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+    del X_train, y_train
+    gc.collect()
+    print(f"  Resampled training size: {len(X_train_res):,}")
 
-    print("Training RandomForestClassifier...")
-    model.fit(X_train, y_train)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_res)
+    X_test_scaled = scaler.transform(X_test)
 
-    # Evaluate on test set
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
+    print("Training RandomForestClassifier …")
+    model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    model.fit(X_train_scaled, y_train_res)
 
-    print(f"\nModel Accuracy: {accuracy:.4f}")
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, target_names=["Normal", "DDoS"]))
+    y_pred = model.predict(X_test_scaled)
+    y_proba = model.predict_proba(X_test_scaled)[:, 1]
 
-    print("Confusion Matrix:")
+    roc_auc = roc_auc_score(y_test, y_proba)
+
+    print("\n--- Evaluation on held-out test set ---")
+    print(classification_report(y_test, y_pred, target_names=["Benign", "Attack"]))
+    print(f"ROC-AUC: {roc_auc:.4f}")
+    print("Confusion matrix:")
     print(confusion_matrix(y_test, y_pred))
 
-    # Feature importance
-    print("\nFeature Importance:")
-    print(f"  packet_rate: {model.feature_importances_[0]:.4f}")
-    print(f"  protocol_id: {model.feature_importances_[1]:.4f}")
-
-    return model
-
-
-def save_model(model: RandomForestClassifier, path: Path = MODEL_PATH) -> None:
-    """
-    Save the trained model to disk using joblib.
-
-    Args:
-        model: Trained model to save.
-        path: File path for the saved model.
-    """
-    joblib.dump(model, path)
-    print(f"\nModel saved to: {path}")
-
-
-def main():
-    """Main training pipeline."""
-    print("=" * 60)
-    print("DDoS Attack Classification Model Training")
-    print("=" * 60)
-
-    # Generate synthetic data
-    print("\nGenerating synthetic traffic data (2000 samples)...")
-    features, labels = generate_synthetic_data(n_samples=2000)
-
-    print(f"  Total samples: {len(labels)}")
-    print(f"  Normal traffic: {np.sum(labels == 0)}")
-    print(f"  DDoS attacks: {np.sum(labels == 1)}")
-    print(f"  Feature shape: {features.shape}")
-
-    # Train the model
-    model = train_model(features, labels)
-
-    # Save the model
-    save_model(model)
-
-    print("\n" + "=" * 60)
-    print("Training complete!")
-    print("=" * 60)
+    artifact = {
+        "model": model,
+        "scaler": scaler,
+        "feature_names": FEATURE_COLUMNS,
+        "roc_auc": roc_auc,
+    }
+    output_path = Path(__file__).parent / "model.pkl"
+    joblib.dump(artifact, output_path)
+    print(f"\nModel artifact saved to {output_path}")
 
 
 if __name__ == "__main__":

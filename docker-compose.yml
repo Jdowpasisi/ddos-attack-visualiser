@@ -6,6 +6,18 @@ version: '3.8'
 services:
   # ============ PostgreSQL Database ============
   db:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c effective_cache_size=128MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=32MB
+      -c max_connections=20
+      -c wal_buffers=4MB
     image: postgres:15-alpine
     container_name: ddos-db
     restart: unless-stopped
@@ -28,6 +40,12 @@ services:
 
   # ============ FastAPI Backend ============
   backend:
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+        reservations:
+          memory: 128M
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -44,13 +62,20 @@ services:
       LOG_LEVEL: INFO
       
       # Ingestion settings
-      INGESTION_INTERVAL_SECONDS: "10"
+      INGESTION_INTERVAL_SECONDS: ${INGESTION_INTERVAL_SECONDS:-5}
       INGESTION_BATCH_SIZE: "5"
       DISPLAY_RATE_PER_SECOND: ${DISPLAY_RATE_PER_SECOND:-3}
+      MIN_REAL_EVENTS_PER_BATCH: ${MIN_REAL_EVENTS_PER_BATCH:-5}
+      
+      # Investigation threshold — trigger AI agent for events at or above this severity.
+      # ML scores currently top out ~2.5; set to 2.3 to target only the highest-scoring events.
+      INVESTIGATION_THRESHOLD: "2.3"
+      INVESTIGATION_COOLDOWN_SECONDS: "15"
       
       # GROQ_API_KEY is loaded via env_file (backend/.env)
       # Geo service backend (ip-api for real coordinates)
       GEO_BACKEND: ip-api
+      UVICORN_WORKERS: "1"
     ports:
       - "8000:8000"
     depends_on:
@@ -69,16 +94,13 @@ services:
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        # API URL for frontend to call backend
-        VITE_API_URL: http://localhost:8000
-    container_name: ddos-frontend
-    restart: unless-stopped
+      dockerfile: Dockerfile.prod
     ports:
-      - "3000:3000"
-    depends_on:
-      - backend
+      - "3000:80"
+    deploy:
+      resources:
+        limits:
+          memory: 64M
     networks:
       - ddos-network
 

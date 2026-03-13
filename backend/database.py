@@ -68,3 +68,18 @@ async def drop_tables() -> None:
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+async def apply_migrations() -> None:
+    """
+    Apply incremental schema changes that create_all cannot handle
+    (i.e. adding columns to already-existing tables).
+    """
+    migrations = [
+        "ALTER TABLE incident_reports ADD COLUMN IF NOT EXISTS is_repeat_attacker BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE incident_reports ADD COLUMN IF NOT EXISTS campaign_detected BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE incident_reports ADD COLUMN IF NOT EXISTS pattern_summary TEXT",
+    ]
+    async with engine.begin() as conn:
+        for stmt in migrations:
+            await conn.execute(__import__('sqlalchemy').text(stmt))

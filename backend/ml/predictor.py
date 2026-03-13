@@ -1,127 +1,34 @@
 """
 Predictor module for DDoS threat classification.
 
-Loads a trained model and provides prediction functionality
-for classifying network traffic as normal or DDoS.
+Loads the trained CICIDS2017 model artifact and scores live threat
+dictionaries against the full CICIDS feature set.
 """
 
+from functools import lru_cache
 from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 
-# Model path
-MODEL_DIR = Path(__file__).parent
-MODEL_PATH = MODEL_DIR / "model.pkl"
+MODEL_PATH = Path(__file__).parent / "model.pkl"
 
-# Global model instance (loaded on module import)
-_model: RandomForestClassifier | None = None
-
-
-def load_model(path: Path = MODEL_PATH) -> RandomForestClassifier:
-    """
-    Load the trained model from disk.
-
-    Args:
-        path: Path to the saved model file.
-
-    Returns:
-        Loaded RandomForestClassifier model.
-
-    Raises:
-        FileNotFoundError: If the model file doesn't exist.
-    """
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Model file not found at {path}. "
-            "Please run trainer.py first to train and save the model."
-        )
-
-    return joblib.load(path)
+# Fallback feature list (mirrors trainer.py) used when the artifact
+# pre-dates the feature_names key.
+_DEFAULT_FEATURE_COLUMNS = [
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Total Length of Fwd Packets",
+    "Flow Bytes/s",
+    "Flow Packets/s",
+    "Flow IAT Mean",
+    "Fwd PSH Flags",
+]
 
 
-def get_model() -> RandomForestClassifier:
-    """
-    Get the loaded model instance (singleton pattern).
-
-    Returns:
-        The loaded RandomForestClassifier model.
-    """
-    global _model
-    if _model is None:
-        _model = load_model()
-    return _model
-
-
-def predict_threat(packet_rate: int, protocol_id: int) -> float:
-    """
-    Predict the threat probability for given traffic characteristics.
-
-    Args:
-        packet_rate: Number of packets per second.
-        protocol_id: Protocol identifier (0=TCP, 1=UDP, 2=ICMP, 3=HTTP, 4=HTTPS, 5=DNS).
-
-    Returns:
-        Probability score between 0 and 1, where:
-        - 0.0 = definitely normal traffic
-        - 1.0 = definitely DDoS attack
-
-    Example:
-        >>> predict_threat(packet_rate=50000, protocol_id=1)  # High UDP traffic
-        0.95
-        >>> predict_threat(packet_rate=100, protocol_id=4)    # Low HTTPS traffic
-        0.02
-    """
-    model = get_model()
-
-    # Prepare features as 2D array
-    features = np.array([[packet_rate, protocol_id]])
-
-    # Get probability of DDoS class (class 1)
-    probabilities = model.predict_proba(features)
-    ddos_probability = probabilities[0, 1]
-
-    return float(ddos_probability)
-
-
-def predict_threat_batch(packet_rates: list[int], protocol_ids: list[int]) -> list[float]:
-    """
-    Predict threat probabilities for multiple traffic samples.
-
-    Args:
-        packet_rates: List of packet rates.
-        protocol_ids: List of protocol identifiers.
-
-    Returns:
-        List of probability scores between 0 and 1.
-    """
-    model = get_model()
-
-    features = np.column_stack([packet_rates, protocol_ids])
-    probabilities = model.predict_proba(features)
-
-    return probabilities[:, 1].tolist()
-
-
-def classify_threat(packet_rate: int, protocol_id: int, threshold: float = 0.5) -> str:
-    """
-    Classify traffic as 'normal' or 'ddos' based on threshold.
-
-    Args:
-        packet_rate: Number of packets per second.
-        protocol_id: Protocol identifier.
-        threshold: Classification threshold (default 0.5).
-
-    Returns:
-        'normal' or 'ddos' classification string.
-    """
-    probability = predict_threat(packet_rate, protocol_id)
-    return "ddos" if probability >= threshold else "normal"
-
-
-# Protocol constants for convenience
 class Protocol:
+    """Application-level protocol constants."""
     TCP = 0
     UDP = 1
     ICMP = 2
@@ -130,35 +37,124 @@ class Protocol:
     DNS = 5
 
 
-# Load model on module import for fast predictions
-def init():
-    """Initialize the predictor by loading the model."""
+@lru_cache(maxsize=1)
+def get_artifact() -> dict:
+    """
+    Load model.pkl and return a normalised artifact dict.
+
+    The result is cached after the first call so subsequent predictions
+    pay no I/O cost.  Legacy models (bare sklearn estimators) are wrapped
+    automatically.
+
+    Raises:
+        FileNotFoundError: If model.pkl has not been generated yet.
+    """
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Model file not found at {MODEL_PATH}. "
+            "Run backend/ml/trainer.py first to train the model."
+        )
+
+    raw = joblib.load(MODEL_PATH, mmap_mode='r')
+
+    if not isinstance(raw, dict):
+        # Legacy artifact: bare RandomForestClassifier
+        return {
+            "model": raw,
+            "scaler": None,
+            "feature_names": _DEFAULT_FEATURE_COLUMNS,
+            "roc_auc": None,
+        }
+
+    return raw
+
+
+def score_threat(threat: dict) -> float:
+    """
+    Score a threat dictionary and return a severity value between 0 and 10.
+
+    Maps ``packet_rate`` and ``protocol_id`` to the CICIDS2017 feature vector,
+    runs inference through the trained model, then applies a packet-rate bonus
+    to produce an interpretable severity score.
+
+    Args:
+        threat: Dict containing at least ``packet_rate`` (int) and
+                ``protocol_id`` (int, using the ``Protocol`` constants).
+
+    Returns:
+        Severity score in [0.0, 10.0], rounded to two decimal places.
+    """
+    packet_rate: int = int(threat.get("packet_rate", 0))
+    protocol_id: int = int(threat.get("protocol_id", 0))
+
+    # TCP-based protocols: TCP=0, HTTP=3, HTTPS=4
+    is_tcp = protocol_id in (0, 3, 4)
+
+    # Derive plausible CICIDS feature values from the available signal.
+    # Assumes a 1-second observation window and a symmetric bidirectional flow.
+    safe_rate = max(packet_rate, 1)
+    fwd_pkts = max(packet_rate // 2, 1)
+
+    feature_map: dict[str, float] = {
+        "Flow Duration":                1_000_000.0,           # 1 s in microseconds
+        "Total Fwd Packets":            float(fwd_pkts),
+        "Total Backward Packets":       float(fwd_pkts),
+        "Total Length of Fwd Packets":  float(fwd_pkts * 64),  # 64-byte average payload
+        "Flow Bytes/s":                 float(packet_rate * 64),
+        "Flow Packets/s":               float(packet_rate),
+        "Flow IAT Mean":                1_000_000.0 / safe_rate,
+        "Fwd PSH Flags":                1.0 if is_tcp else 0.0,
+    }
+
+    artifact = get_artifact()
+    feature_names: list[str] = artifact.get("feature_names", _DEFAULT_FEATURE_COLUMNS)
+    X = np.array([[feature_map[f] for f in feature_names]], dtype=np.float32)
+
+    scaler = artifact.get("scaler")
+    if scaler is not None:
+        X = scaler.transform(X)
+
+    probability: float = float(artifact["model"].predict_proba(X)[0, 1])
+
+    # Packet-rate bonus: high-volume floods warrant extra severity
+    if packet_rate > 100_000:
+        rate_bonus = min(2.0, (packet_rate - 100_000) / 200_000 * 2)
+    elif packet_rate > 50_000:
+        rate_bonus = 1.0
+    elif packet_rate > 20_000:
+        rate_bonus = 0.5
+    else:
+        rate_bonus = 0.0
+
+    severity = min(10.0, probability * 8.0 + rate_bonus)
+    return round(severity, 2)
+
+
+def init() -> None:
+    """Pre-warm the model cache.  Safe to call at application startup."""
     try:
-        get_model()
+        get_artifact()
         print(f"ML model loaded successfully from {MODEL_PATH}")
     except FileNotFoundError as e:
         print(f"Warning: {e}")
 
 
-# Example usage
 if __name__ == "__main__":
     init()
 
-    # Test predictions
     test_cases = [
-        (100, Protocol.HTTPS, "Low HTTPS traffic"),
-        (50, Protocol.TCP, "Low TCP traffic"),
-        (25000, Protocol.UDP, "High UDP traffic"),
-        (80000, Protocol.ICMP, "Very high ICMP traffic"),
-        (45000, Protocol.DNS, "DNS amplification pattern"),
+        (100,    Protocol.HTTPS, "Low HTTPS traffic"),
+        (50,     Protocol.TCP,   "Low TCP traffic"),
+        (25_000, Protocol.UDP,   "High UDP traffic"),
+        (80_000, Protocol.ICMP,  "Very high ICMP traffic"),
+        (45_000, Protocol.DNS,   "DNS amplification pattern"),
     ]
 
     print("\nTest Predictions:")
     print("-" * 60)
-    for packet_rate, protocol_id, description in test_cases:
-        prob = predict_threat(packet_rate, protocol_id)
-        classification = classify_threat(packet_rate, protocol_id)
+    for pkt_rate, proto, description in test_cases:
+        severity = score_threat({"packet_rate": pkt_rate, "protocol_id": proto})
         print(f"{description}:")
-        print(f"  packet_rate={packet_rate}, protocol={protocol_id}")
-        print(f"  Threat probability: {prob:.4f} ({classification})")
+        print(f"  packet_rate={pkt_rate}, protocol={proto}")
+        print(f"  Severity: {severity:.2f} / 10.0")
         print()

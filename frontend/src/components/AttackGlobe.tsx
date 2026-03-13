@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import Globe, { GlobeMethods } from 'react-globe.gl';
-import { CyberDashboard, ServerStatus, ThreatEvent, AttackStats } from './CyberDashboard';
+import { CyberDashboard, ThreatEvent, AttackStats } from './CyberDashboard';
 import { MAX_ARCS, ARC_TTL_MS, FETCH_INTERVAL_MS, STATS_INTERVAL_MS } from '../constants';
 
 // Types for attack data from API
@@ -20,6 +20,7 @@ interface AttackArc {
   timestamp: string;
   sourceIp: string;
   targetIp: string;
+  isSimulated: boolean;
 }
 
 interface StreamResponse {
@@ -52,6 +53,7 @@ export interface GlobeArc {
   data: AttackArc;
   hitCount: number;       // Number of aggregated events
   lastHitAt: number;      // Timestamp of most recent hit (ms)
+  isSimulated: boolean;
 }
 
 // Severity to color mapping
@@ -123,6 +125,7 @@ const AttackGlobe: React.FC = () => {
     },
     hitCount: 1,
     lastHitAt: Date.now(),
+    isSimulated: attack.isSimulated ?? false,
   }), []);
 
   // Filter out expired arcs based on TTL
@@ -176,15 +179,26 @@ const AttackGlobe: React.FC = () => {
           const existing = arcMap.get(key);
 
           if (existing) {
-            // Update in place
             const newCount = existing.hitCount + 1;
+            // KEY FIX: Retain the highest severity and packet rate ever seen for this pattern
+            const peakSeverity = Math.max(existing.data.severity, incoming.data.severity);
+            const peakPacketRate = Math.max(existing.data.packetRate, incoming.data.packetRate);
+
             arcMap.set(key, {
               ...existing,
               hitCount: newCount,
               lastHitAt: now,
-              stroke: getStrokeWidth(newCount, incoming.data.severity),
-              color: getAggregatedColor(incoming.data.severity, newCount),
-              label: `${incoming.data.attackType} · ${incoming.data.sourceIp} → ${incoming.data.targetIp} · ${newCount} hits · Severity ${incoming.data.severity}`,
+              // Use peakSeverity for visual calculations
+              stroke: getStrokeWidth(newCount, peakSeverity),
+              color: getAggregatedColor(peakSeverity, newCount),
+              label: `${incoming.data.attackType} · ${incoming.data.sourceIp} → ${incoming.data.targetIp} · ${newCount} hits · Severity ${peakSeverity.toFixed(1)}`,
+              // OVERRIDE the data object so the peak values persist and get passed down
+              data: {
+                ...existing.data,
+                severity: peakSeverity,
+                packetRate: peakPacketRate,
+                timestamp: incoming.data.timestamp // keep the most recent timestamp
+              }
             });
           } else {
             // Create new
@@ -292,6 +306,25 @@ const AttackGlobe: React.FC = () => {
     }
   }, []);
 
+  // Calculate how many real arcs we currently have
+  const realArcCount = arcsData.filter(arc => !arc.isSimulated).length;
+  const SIMULATED_VISIBILITY_THRESHOLD = 20;
+
+  // Filter out simulated arcs entirely if we are at or above threshold
+  const visibleArcs = realArcCount >= SIMULATED_VISIBILITY_THRESHOLD
+    ? arcsData.filter(arc => !arc.isSimulated)
+    : arcsData;
+
+  // Calculate dynamic opacity for simulated arcs (0.0 to 0.6)
+  const simulatedOpacityFloat = realArcCount >= SIMULATED_VISIBILITY_THRESHOLD
+    ? 0
+    : (1 - realArcCount / SIMULATED_VISIBILITY_THRESHOLD) * 0.6;
+
+  // Convert float to 2-character hex (e.g., 0.6 -> "99", 0.3 -> "4c")
+  const simulatedOpacityHex = Math.floor(simulatedOpacityFloat * 255)
+    .toString(16)
+    .padStart(2, '0');
+
   // Server point data for visualization
   const serverPointData = [
     {
@@ -317,25 +350,30 @@ const AttackGlobe: React.FC = () => {
         ref={globeRef}
         globeImageUrl="//unpkg.com/three-globe/example/img/earth-night.jpg"
         backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
-        // Arc layer configuration - use activeArcs (TTL-filtered)
-        arcsData={activeArcs}
+        // Arc layer configuration - use visibleArcs (TTL-filtered + simulated visibility)
+        arcsData={visibleArcs}
         arcStartLat={(d) => (d as GlobeArc).startLat}
         arcStartLng={(d) => (d as GlobeArc).startLng}
         arcEndLat={(d) => (d as GlobeArc).endLat}
         arcEndLng={(d) => (d as GlobeArc).endLng}
-        arcColor={(d) => {
-          const arc = d as GlobeArc;
-          if (selectedArc && arcKey(selectedArc.data) !== arcKey(arc.data)) {
-            return arc.color + '40';
+        arcColor={(arc) => {
+          const a = arc as GlobeArc;
+          const isSelected = selectedArc?.data.id === a.data.id;
+          const hasSel = selectedArc !== null;
+          const opacity = hasSel && !isSelected ? "40" : "FF";
+
+          // Simulated arcs use dynamic opacity based on real arc count
+          if (a.isSimulated) {
+            const dimState = hasSel && !isSelected ? "20" : simulatedOpacityHex;
+            return a.color + dimState;
           }
-          return arc.color;
+          return a.color + opacity;
         }}
-        arcStroke={(d) => {
-          const arc = d as GlobeArc;
-          if (selectedArc && arcKey(selectedArc.data) === arcKey(arc.data)) {
-            return arc.stroke * 2;
-          }
-          return arc.stroke;
+        arcStroke={(arc) => {
+          const a = arc as GlobeArc;
+          const base = a.stroke ?? 1;
+          if (selectedArc?.data.id === a.data.id) return base * 2;
+          return base;
         }}
         onArcClick={(d) => {
           const arc = d as GlobeArc;
@@ -343,9 +381,9 @@ const AttackGlobe: React.FC = () => {
             prev && arcKey(prev.data) === arcKey(arc.data) ? null : arc
           );
         }}
-        arcDashLength={0.5}
-        arcDashGap={0.2}
-        arcDashAnimateTime={2000}
+        arcDashLength={0.4}
+        arcDashGap={0.6}
+        arcDashAnimateTime={1500}
         arcLabel={(d) => (d as GlobeArc).label}
         arcsTransitionDuration={300}
         // Point layer for server location
@@ -378,7 +416,7 @@ const AttackGlobe: React.FC = () => {
         stats={stats}
         backlog={backlog}
         totalEvents={activeArcs.length}
-        arcCount={arcsData.length}
+        arcCount={visibleArcs.length}
         arcMax={MAX_ARCS}
         isLive={!isLoading && !error}
         error={error}
@@ -386,6 +424,7 @@ const AttackGlobe: React.FC = () => {
         onTogglePause={() => setIsPaused((p) => !p)}
         selectedArc={selectedArc}
         onDeselectArc={() => setSelectedArc(null)}
+        serverStatus={MY_SERVER_COORDS}
       />
 
       {/* Paused state full-screen border overlay */}
@@ -401,16 +440,7 @@ const AttackGlobe: React.FC = () => {
         />
       )}
 
-      {/* Server Location Info (hidden when arc detail panel is shown) */}
-      {!selectedArc && (
-        <div className="absolute bottom-4 left-4 z-10 md:bottom-6 md:left-6">
-          <ServerStatus
-            label={MY_SERVER_COORDS.label}
-            lat={MY_SERVER_COORDS.lat}
-            lon={MY_SERVER_COORDS.lon}
-          />
-        </div>
-      )}
+      {/* Server Location Info is now rendered inside CyberDashboard (bottom-left column) */}
     </div>
   );
 };

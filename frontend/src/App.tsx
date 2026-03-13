@@ -1,7 +1,12 @@
 import AttackGlobe from './components/AttackGlobe'
+import { DashboardProvider } from './context/DashboardContext'
 
 function App() {
-  return <AttackGlobe />
+  return (
+    <DashboardProvider>
+      <AttackGlobe />
+    </DashboardProvider>
+  )
 }
 
 export default App
