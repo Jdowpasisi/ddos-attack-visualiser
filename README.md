@@ -185,7 +185,7 @@ Every 10 seconds the ingestion loop runs:
 ### With Docker (recommended)
 
 ```bash
-git clone https://github.com/yourusername/ddos-attack-visualiser.git
+git clone https://github.com/Jdowpasisi/ddos-attack-visualiser.git
 cd ddos-attack-visualiser
 
 # Copy and configure environment
